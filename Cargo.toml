@@ -1,0 +1,26 @@
+[package]
+name = "silocut"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+egui = "0.34.3"
+eframe = "0.34.3"
+openh264 = { version = "0.9.3", features = ["source"] }
+symphonia = { version = "0.6.0", features = ["all"] }
+symphonia-core = "0.6.0"
+rodio = { version = "0.20.1", features = ["wav", "mp3"] }
+rfd = "0.15.0"
+image = { version = "0.25.0", default-features = false, features = ["png"] }
+rayon = "1.10.0"
+
+# Note: We will use the pure-rust mp4e-mux or mp4e if available, or write custom mp4 structure since we only need H.264 muxing.
+# Let's search if mp4e is on crates.io, we will add it or write a simple raw stream / helper.
+mp4e = "1.0.5"
+
+[profile.release]
+opt-level = "z"      # Optimize for size
+lto = true           # Link-time optimization
+codegen-units = 1    # Allow maximum optimization optimizations
+panic = "abort"      # Remove panic unwinding overhead
+strip = true         # Strip symbols
