@@ -7,6 +7,7 @@ mod preview;
 mod export;
 mod recorder;
 mod codec;
+mod thumbnail;
 
 use editor::EditorState;
 use preview::PreviewEngine;
@@ -51,6 +52,11 @@ struct SiloCutApp {
     audio_decode_rx: std::sync::mpsc::Receiver<(usize, Result<Vec<f32>, String>)>,
     audio_decode_tx: std::sync::mpsc::Sender<(usize, Result<Vec<f32>, String>)>,
     decoding_assets: std::collections::HashSet<usize>,
+
+    // Background timeline thumbnail generation.
+    thumbnails: thumbnail::ThumbnailService,
+    thumb_textures: std::collections::HashMap<usize, egui::TextureHandle>,
+    thumb_requested: std::collections::HashSet<usize>,
 }
 
 impl SiloCutApp {
@@ -92,6 +98,9 @@ impl SiloCutApp {
             audio_decode_rx,
             audio_decode_tx,
             decoding_assets: std::collections::HashSet::new(),
+            thumbnails: thumbnail::ThumbnailService::new(),
+            thumb_textures: std::collections::HashMap::new(),
+            thumb_requested: std::collections::HashSet::new(),
         }
     }
 
@@ -234,6 +243,7 @@ impl eframe::App for SiloCutApp {
             || !self.decoding_assets.is_empty()
             || self.export_in_progress
             || self.record_countdown.is_some()
+            || self.thumb_textures.len() < self.thumb_requested.len()
         {
             ctx.request_repaint();
         }
@@ -243,6 +253,19 @@ impl eframe::App for SiloCutApp {
             while let Ok(p) = prx.try_recv() {
                 self.export_progress = p;
             }
+        }
+
+        // Request timeline thumbnails for visual assets, and ingest finished ones.
+        for asset in &self.state.assets {
+            if (asset.is_video || asset.is_image) && !self.thumb_requested.contains(&asset.id) {
+                self.thumb_requested.insert(asset.id);
+                self.thumbnails.request(asset.id, asset.path.clone(), asset.is_image);
+            }
+        }
+        while let Ok(resp) = self.thumbnails.rx.try_recv() {
+            let color = egui::ColorImage::from_rgba_unmultiplied([resp.width, resp.height], &resp.rgba);
+            let tex = ctx.load_texture(format!("thumb_{}", resp.asset_id), color, Default::default());
+            self.thumb_textures.insert(resp.asset_id, tex);
         }
 
         // Receive background audio decoding updates
@@ -505,7 +528,7 @@ impl eframe::App for SiloCutApp {
             .resizable(true)
             .default_size(250.0)
             .show_inside(ui, |ui| {
-                timeline_ui::show_timeline(ui, &mut self.state);
+                timeline_ui::show_timeline(ui, &mut self.state, &self.thumb_textures);
             });
 
         // Left Panel - Media Bin

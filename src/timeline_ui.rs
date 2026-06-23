@@ -31,7 +31,11 @@ enum DragState {
     },
 }
 
-pub fn show_timeline(ui: &mut egui::Ui, state: &mut EditorState) {
+pub fn show_timeline(
+    ui: &mut egui::Ui,
+    state: &mut EditorState,
+    thumbs: &std::collections::HashMap<usize, egui::TextureHandle>,
+) {
     let header_width = 160.0;
     let ruler_height = 30.0;
     let track_height = 60.0;
@@ -402,14 +406,29 @@ pub fn show_timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                         ));
                     }
 
-                    // Audio waveform for audio-track clips that have decoded samples.
+                    // Per-clip visuals: a waveform for audio-track clips, or a poster
+                    // thumbnail at the left of video/image clips.
                     let asset = state.assets.iter().find(|a| a.id == clip.asset_id);
+                    let mut label_x = x_start + 6.0;
                     if !is_video {
                         if let Some(asset) = asset {
                             if let Some(ref samples) = asset.audio_samples {
                                 draw_waveform(&clip_painter, clip_rect, clip, asset, samples);
                             }
                         }
+                    } else if let Some(tex) = thumbs.get(&clip.asset_id) {
+                        let sz = tex.size();
+                        let aspect = sz[0] as f32 / (sz[1].max(1) as f32);
+                        let pw = (aspect * clip_rect.height()).min(clip_rect.width());
+                        let poster =
+                            Rect::from_min_max(clip_rect.min, pos2(clip_rect.left() + pw, clip_rect.bottom()));
+                        clip_painter.image(
+                            tex.id(),
+                            poster,
+                            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                            Color32::WHITE,
+                        );
+                        label_x = (clip_rect.left() + pw + 4.0).min(clip_rect.right());
                     }
 
                     // Label details
@@ -420,7 +439,7 @@ pub fn show_timeline(ui: &mut egui::Ui, state: &mut EditorState) {
 
                     let text_painter = clip_painter.with_clip_rect(clip_rect);
                     text_painter.text(
-                        pos2(x_start + 6.0, top_y + track_height / 2.0),
+                        pos2(label_x, top_y + track_height / 2.0),
                         Align2::LEFT_CENTER,
                         label_text,
                         FontId::proportional(11.0),
