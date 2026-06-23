@@ -6,7 +6,7 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::formats::probe::Hint;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct MediaAsset {
     pub id: usize,
     pub path: PathBuf,
@@ -16,6 +16,8 @@ pub struct MediaAsset {
     pub height: u32,
     pub fps: f64,
     pub is_video: bool,
+    // Decoded PCM samples are re-derived from `path` on load, never serialized.
+    #[serde(skip)]
     pub audio_samples: Option<Arc<Vec<f32>>>,
     pub audio_channels: u32,
     pub audio_sample_rate: u32,

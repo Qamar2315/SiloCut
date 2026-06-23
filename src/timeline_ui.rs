@@ -57,6 +57,17 @@ pub fn show_timeline(ui: &mut egui::Ui, state: &mut EditorState) {
         if ui.button("Reset").clicked() {
             state.zoom_factor = 15.0;
         }
+        if ui.button("Fit").clicked() {
+            let mut max_t = 1.0f64;
+            for tr in state.video_tracks.iter().chain(state.audio_tracks.iter()) {
+                for c in &tr.clips {
+                    max_t = max_t.max(c.timeline_end);
+                }
+            }
+            let visible = (ui.ctx().content_rect().width() - header_width - 16.0).max(200.0);
+            state.zoom_factor = (visible / max_t as f32).clamp(5.0, 100.0);
+            state.scroll_offset = 0.0;
+        }
         ui.separator();
 
         if ui.button("➕ Video Track").clicked() {
@@ -139,6 +150,20 @@ pub fn show_timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     let timeline_visible_width = ui.available_width() - header_width - 16.0;
     let max_scroll = ((timeline_width_secs as f32 * state.zoom_factor) - timeline_visible_width).max(0.0);
     state.scroll_offset = state.scroll_offset.clamp(0.0, max_scroll);
+
+    // During playback, auto-scroll so the playhead stays visible.
+    if state.is_playing && max_scroll > 0.0 {
+        let playhead_x = state.playhead_secs as f32 * state.zoom_factor - state.scroll_offset;
+        let margin = 40.0;
+        if playhead_x > timeline_visible_width - margin {
+            state.scroll_offset =
+                (state.playhead_secs as f32 * state.zoom_factor - (timeline_visible_width - margin))
+                    .clamp(0.0, max_scroll);
+        } else if playhead_x < margin {
+            state.scroll_offset =
+                (state.playhead_secs as f32 * state.zoom_factor - margin).clamp(0.0, max_scroll);
+        }
+    }
 
     let mut video_track_to_delete = None;
     let mut audio_track_to_delete = None;

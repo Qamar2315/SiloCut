@@ -235,6 +235,7 @@ pub fn export_timeline(
     width: u32,
     height: u32,
     fps: u32,
+    quality_scale: f32,
     progress: impl Fn(f32),
 ) -> Result<(), String> {
     // Determine export duration
@@ -294,7 +295,7 @@ pub fn export_timeline(
 
     // Set up H.264 Encoder. The OpenH264 default (120 kbps) would render the export
     // unwatchable; codec::build_encoder scales the bitrate to the resolution.
-    let mut encoder = crate::codec::build_encoder(width, height, fps, false)?;
+    let mut encoder = crate::codec::build_encoder(width, height, fps, false, quality_scale)?;
     let mut bitstream_buffer = Vec::new();
 
     // Cache of open asset decoders

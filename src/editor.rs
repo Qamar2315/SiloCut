@@ -1,6 +1,6 @@
 use crate::media::MediaAsset;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Clip {
     pub id: usize,
     pub asset_id: usize,
@@ -12,7 +12,7 @@ pub struct Clip {
     pub fade_out_duration: f64,  // in seconds
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Track {
     pub id: usize,
     pub name: String,
@@ -24,13 +24,13 @@ pub struct Track {
     pub clips: Vec<Clip>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum EditTool {
     Select,
     Razor,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct EditorState {
     pub assets: Vec<MediaAsset>,
     pub video_tracks: Vec<Track>,
@@ -95,4 +95,63 @@ impl EditorState {
         track.clips.insert(clip_idx + 1, second_clip);
         self.selected_clip = None;
     }
+
+    /// Remove a clip and slide later clips on the same track left to close the gap.
+    pub fn ripple_delete(&mut self, is_video: bool, track_idx: usize, clip_idx: usize) {
+        let tracks = if is_video { &mut self.video_tracks } else { &mut self.audio_tracks };
+        if track_idx >= tracks.len() || clip_idx >= tracks[track_idx].clips.len() {
+            return;
+        }
+        let removed = tracks[track_idx].clips.remove(clip_idx);
+        let gap = removed.timeline_end - removed.timeline_start;
+        for clip in tracks[track_idx].clips.iter_mut() {
+            if clip.timeline_start >= removed.timeline_end - 1e-9 {
+                clip.timeline_start -= gap;
+                clip.timeline_end -= gap;
+            }
+        }
+        self.selected_clip = None;
+    }
+
+    /// Place a copy of a clip after it on the same track, nudged to the first free
+    /// slot so it never overlaps an existing clip.
+    pub fn duplicate_clip(&mut self, is_video: bool, track_idx: usize, clip_idx: usize) {
+        let new_id = self.next_clip_id;
+        let tracks = if is_video { &mut self.video_tracks } else { &mut self.audio_tracks };
+        if track_idx >= tracks.len() || clip_idx >= tracks[track_idx].clips.len() {
+            return;
+        }
+        let mut copy = tracks[track_idx].clips[clip_idx].clone();
+        let dur = copy.timeline_end - copy.timeline_start;
+        let start = earliest_free_start(&tracks[track_idx].clips, copy.timeline_end, dur, usize::MAX);
+        copy.id = new_id;
+        copy.timeline_start = start;
+        copy.timeline_end = start + dur;
+        tracks[track_idx].clips.push(copy);
+        tracks[track_idx].clips.sort_by(|a, b| a.timeline_start.partial_cmp(&b.timeline_start).unwrap());
+        self.next_clip_id += 1;
+        self.selected_clip = None;
+    }
+}
+
+/// Find the earliest start time >= `desired` at which a clip of length `dur` fits
+/// without overlapping any existing clip (ignoring the clip with id `exclude`).
+fn earliest_free_start(clips: &[Clip], desired: f64, dur: f64, exclude: usize) -> f64 {
+    let mut start = desired.max(0.0);
+    for _ in 0..clips.len() + 1 {
+        let mut moved = false;
+        for c in clips {
+            if c.id == exclude {
+                continue;
+            }
+            if start < c.timeline_end && start + dur > c.timeline_start {
+                start = c.timeline_end;
+                moved = true;
+            }
+        }
+        if !moved {
+            break;
+        }
+    }
+    start
 }

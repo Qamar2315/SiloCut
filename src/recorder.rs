@@ -146,7 +146,7 @@ impl ScreenRecorder {
             // Setup H.264 Encoder tuned for screen capture. The OpenH264 default
             // (120 kbps, frame-skipping on, no periodic keyframes) is unusable for
             // full-screen recording; see `codec::build_encoder`.
-            let mut encoder = crate::codec::build_encoder(width as u32, height as u32, fps, true)?;
+            let mut encoder = crate::codec::build_encoder(width as u32, height as u32, fps, true, 1.0)?;
 
             // Bitmap Info Header for GetDIBits
             let mut bmi = BITMAPINFO {
