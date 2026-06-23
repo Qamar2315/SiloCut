@@ -517,7 +517,7 @@ impl eframe::App for SiloCutApp {
                     } else if !self.export_status.is_empty() {
                         ui.label(&self.export_status);
                     } else {
-                        ui.label("SiloCut v1.4");
+                        ui.label("SiloCut v1.5");
                     }
                 });
             });
