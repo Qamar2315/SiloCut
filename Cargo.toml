@@ -13,10 +13,12 @@ rodio = { version = "0.20.1", features = ["wav", "mp3"] }
 rfd = "0.15.0"
 image = { version = "0.25.0", default-features = false, features = ["png"] }
 rayon = "1.10.0"
-
-# Note: We will use the pure-rust mp4e-mux or mp4e if available, or write custom mp4 structure since we only need H.264 muxing.
-# Let's search if mp4e is on crates.io, we will add it or write a simple raw stream / helper.
 mp4e = "1.0.5"
+windows-sys = { version = "0.52.0", features = [
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Foundation",
+] }
 
 [profile.release]
 opt-level = "z"      # Optimize for size

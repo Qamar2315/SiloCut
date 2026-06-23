@@ -96,33 +96,38 @@ impl AssetExportDecoder {
 
         // Loop and decode packets
         let mut attempts = 0;
-        while attempts < 120 {
+        while attempts < 5000 {
             attempts += 1;
-            let packet = match self.format_reader.next_packet() {
-                Ok(Some(p)) => p,
-                _ => return Ok(None), // EOF
-            };
+            match self.format_reader.next_packet() {
+                Ok(Some(packet)) => {
+                    if packet.track_id != self.video_track_id {
+                        continue;
+                    }
 
-            if packet.track_id != self.video_track_id {
-                continue;
-            }
+                    self.last_pts = packet.pts.get() as u64;
+                    let packet_time = packet.pts.get() as f64 * self.time_base.numer.get() as f64 / self.time_base.denom.get() as f64;
 
-            self.last_pts = packet.pts.get() as u64;
-            let packet_time = packet.pts.get() as f64 * self.time_base.numer.get() as f64 / self.time_base.denom.get() as f64;
-
-            // Decode H.264 frame
-            let mut data = packet.data;
-            avcc_to_annex_b(&mut data);
-            
-            // To satisfy borrow checker, we must only return owned values
-            if let Ok(Some(decoded)) = self.decoder.decode(&data) {
-                if packet_time >= target_time_secs - 0.04 {
-                    use openh264::formats::YUVSource;
-                    let (w, h) = decoded.dimensions();
-                    let mut rgb_raw = vec![0u8; decoded.rgb8_len()];
-                    decoded.write_rgb8(&mut rgb_raw);
-                    return Ok(Some((rgb_raw, w, h)));
+                    // Decode H.264 frame
+                    let mut data = packet.data;
+                    avcc_to_annex_b(&mut data);
+                    
+                    // To satisfy borrow checker, we must only return owned values
+                    if let Ok(Some(decoded)) = self.decoder.decode(&data) {
+                        if packet_time >= target_time_secs - 0.04 {
+                            use openh264::formats::YUVSource;
+                            let (w, h) = decoded.dimensions();
+                            let mut rgb_raw = vec![0u8; decoded.rgb8_len()];
+                            decoded.write_rgb8(&mut rgb_raw);
+                            return Ok(Some((rgb_raw, w, h)));
+                        }
+                    }
                 }
+                Ok(None) => break, // EOF
+                Err(symphonia::core::errors::Error::ResetRequired) => {
+                    self.last_pts = 0;
+                    continue;
+                }
+                Err(_) => break, // Stop reading on critical errors
             }
         }
 

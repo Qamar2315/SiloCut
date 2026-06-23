@@ -5,6 +5,7 @@ mod editor;
 mod timeline_ui;
 mod preview;
 mod export;
+mod recorder;
 
 use editor::EditorState;
 use preview::PreviewEngine;
@@ -13,6 +14,7 @@ use std::path::PathBuf;
 struct SiloCutApp {
     state: EditorState,
     preview: PreviewEngine,
+    recorder: recorder::ScreenRecorder,
     export_in_progress: bool,
     export_status: String,
     show_export_dialog: bool,
@@ -41,6 +43,7 @@ impl SiloCutApp {
         Self {
             state: EditorState::new(),
             preview: PreviewEngine::new(),
+            recorder: recorder::ScreenRecorder::new(),
             export_in_progress: false,
             export_status: String::new(),
             show_export_dialog: false,
@@ -87,6 +90,10 @@ impl SiloCutApp {
 impl eframe::App for SiloCutApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx();
+
+        if self.recorder.is_recording() {
+            ctx.request_repaint();
+        }
 
         // 1. Check for background export thread updates
         if let Some(ref rx) = self.export_rx {
@@ -254,6 +261,59 @@ impl eframe::App for SiloCutApp {
             .default_width(280.0)
             .show(ctx, |ui| {
                 ui.heading("Project Media Bin");
+                ui.separator();
+
+                // Screen Recorder Section
+                ui.group(|ui| {
+                    ui.label(egui::RichText::new("Screen Recorder").strong());
+                    ui.horizontal(|ui| {
+                        if self.recorder.is_recording() {
+                            // Flashing red dot
+                            let time = ui.input(|i| i.time);
+                            let alpha = (((time * 5.0).sin() + 1.0) * 127.5) as u8;
+                            let dot_color = egui::Color32::from_rgba_unmultiplied(239, 68, 68, alpha);
+                            
+                            let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                            ui.painter().circle_filled(rect.center(), 5.0, dot_color);
+                            
+                            ui.label(egui::RichText::new("REC").color(egui::Color32::from_rgb(239, 68, 68)).strong());
+                            
+                            if ui.button("Stop").clicked() {
+                                match self.recorder.stop() {
+                                    Ok(path) => {
+                                        let next_id = self.state.assets.len();
+                                        match media::MediaAsset::load(next_id, &path) {
+                                            Ok(asset) => {
+                                                self.state.assets.push(asset);
+                                                self.export_status = "Recording saved and imported!".to_string();
+                                            }
+                                            Err(e) => {
+                                                self.export_status = format!("Failed to load recorded asset: {}", e);
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        self.export_status = format!("Recording error: {}", e);
+                                    }
+                                }
+                            }
+                        } else {
+                            if ui.button("Start Recording").clicked() {
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("MP4 Video", &["mp4"])
+                                    .set_file_name("recording.mp4")
+                                    .save_file()
+                                {
+                                    if let Err(e) = self.recorder.start(path, 30) {
+                                        self.export_status = format!("Failed to start recording: {}", e);
+                                    } else {
+                                        self.export_status = "Recording started...".to_string();
+                                    }
+                                }
+                            }
+                        }
+                    });
+                });
                 ui.separator();
 
                 if self.state.assets.is_empty() {

@@ -118,7 +118,11 @@ impl PreviewEngine {
             let mut time_base: Option<symphonia_core::units::TimeBase> = None;
             let mut last_decoded_secs = -999.0f64;
 
-            while let Ok(cmd) = cmd_rx.recv() {
+            while let Ok(mut cmd) = cmd_rx.recv() {
+                // Coalesce: drain intermediate commands to process only the latest one
+                while let Ok(next_cmd) = cmd_rx.try_recv() {
+                    cmd = next_cmd;
+                }
                 match cmd {
                     DecoderCommand::RequestFrame { asset_id, path, target_secs } => {
                         let need_open = current_path.as_ref() != Some(&path) || format.is_none();
@@ -191,34 +195,40 @@ impl PreviewEngine {
                         let mut decoded_frame = None;
                         let mut attempts = 0;
 
-                        while attempts < 120 {
+                        while attempts < 5000 {
                             attempts += 1;
-                            if let Ok(Some(packet)) = fmt.next_packet() {
-                                if packet.track_id == vid_id {
-                                    let mut data = packet.data;
-                                    avcc_to_annex_b(&mut data);
-                                    
-                                    if let Ok(Some(yuv)) = dec.decode(&data) {
-                                        let pts_secs = packet.pts.get() as f64 * (tb.numer.get() as f64) / (tb.denom.get() as f64);
-                                        last_decoded_secs = pts_secs;
+                            match fmt.next_packet() {
+                                Ok(Some(packet)) => {
+                                    if packet.track_id == vid_id {
+                                        let mut data = packet.data;
+                                        avcc_to_annex_b(&mut data);
                                         
-                                        if pts_secs >= target_secs || (target_secs - pts_secs).abs() < 0.05 {
-                                            let (w, h) = yuv.dimensions();
-                                            let (y_stride, u_stride, v_stride) = yuv.strides();
-                                            let mut rgba = vec![0u8; w * h * 4];
-                                            yuv420p_to_rgba(
-                                                w, h,
-                                                yuv.y(), yuv.u(), yuv.v(),
-                                                y_stride, u_stride, v_stride,
-                                                &mut rgba
-                                            );
-                                            decoded_frame = Some((rgba, w, h, pts_secs));
-                                            break;
+                                        if let Ok(Some(yuv)) = dec.decode(&data) {
+                                            let pts_secs = packet.pts.get() as f64 * (tb.numer.get() as f64) / (tb.denom.get() as f64);
+                                            last_decoded_secs = pts_secs;
+                                            
+                                            if pts_secs >= target_secs || (target_secs - pts_secs).abs() < 0.05 {
+                                                let (w, h) = yuv.dimensions();
+                                                let (y_stride, u_stride, v_stride) = yuv.strides();
+                                                let mut rgba = vec![0u8; w * h * 4];
+                                                yuv420p_to_rgba(
+                                                    w, h,
+                                                    yuv.y(), yuv.u(), yuv.v(),
+                                                    y_stride, u_stride, v_stride,
+                                                    &mut rgba
+                                                );
+                                                decoded_frame = Some((rgba, w, h, pts_secs));
+                                                break;
+                                            }
                                         }
                                     }
                                 }
-                            } else {
-                                break; // EOF
+                                Ok(None) => break,
+                                Err(symphonia::core::errors::Error::ResetRequired) => {
+                                    last_decoded_secs = -999.0;
+                                    continue;
+                                }
+                                Err(_) => break,
                             }
                         }
 
