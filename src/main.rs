@@ -6,6 +6,7 @@ mod timeline_ui;
 mod preview;
 mod export;
 mod recorder;
+mod codec;
 
 use editor::EditorState;
 use preview::PreviewEngine;
@@ -27,9 +28,15 @@ struct SiloCutApp {
     undo_stack: Vec<EditorState>,
     redo_stack: Vec<EditorState>,
     skip_undo_save: bool,
+    // Pre-interaction snapshot, used to coalesce a continuous drag into a single
+    // undo entry (captured on pointer-down, committed on release).
+    interaction_baseline: Option<EditorState>,
 
     // Channel receiver for background export thread
     export_rx: Option<std::sync::mpsc::Receiver<Result<PathBuf, String>>>,
+    // Progress (0.0–1.0) reported by the background export thread.
+    export_progress: f32,
+    export_progress_rx: Option<std::sync::mpsc::Receiver<f32>>,
 
     // Asynchronous audio decoding channels
     audio_decode_rx: std::sync::mpsc::Receiver<(usize, Result<Vec<f32>, String>)>,
@@ -61,19 +68,33 @@ impl SiloCutApp {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             skip_undo_save: false,
+            interaction_baseline: None,
             export_rx: None,
+            export_progress: 0.0,
+            export_progress_rx: None,
             audio_decode_rx,
             audio_decode_tx,
             decoding_assets: std::collections::HashSet::new(),
         }
     }
 
-    fn save_state_to_undo(&mut self) {
+    /// Push a *pre-change* snapshot onto the undo stack (capped at 50 entries).
+    fn push_undo_state(&mut self, snapshot: EditorState) {
         if self.undo_stack.len() >= 50 {
             self.undo_stack.remove(0);
         }
-        self.undo_stack.push(self.state.clone());
+        self.undo_stack.push(snapshot);
         self.redo_stack.clear();
+    }
+
+    /// Whether two states differ in a way worth recording for undo. Only timeline
+    /// content matters — selection, playhead, zoom and scroll are not undoable.
+    fn timeline_differs(a: &EditorState, b: &EditorState) -> bool {
+        a.video_tracks != b.video_tracks
+            || a.audio_tracks != b.audio_tracks
+            || a.assets.len() != b.assets.len()
+            || a.next_clip_id != b.next_clip_id
+            || a.next_track_id != b.next_track_id
     }
 
     fn undo(&mut self) {
@@ -99,10 +120,19 @@ impl SiloCutApp {
 
 impl eframe::App for SiloCutApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx();
+        // Clone the context (cheap Arc) so we can still hold a handle to it for
+        // ctx-level calls while passing `ui` mutably to the panels' `show_inside`.
+        let ctx = ui.ctx().clone();
 
-        if self.recorder.is_recording() || !self.decoding_assets.is_empty() {
+        if self.recorder.is_recording() || !self.decoding_assets.is_empty() || self.export_in_progress {
             ctx.request_repaint();
+        }
+
+        // Drain export progress updates from the background thread.
+        if let Some(ref prx) = self.export_progress_rx {
+            while let Ok(p) = prx.try_recv() {
+                self.export_progress = p;
+            }
         }
 
         // Receive background audio decoding updates
@@ -129,12 +159,16 @@ impl eframe::App for SiloCutApp {
         if let Some(ref rx) = self.export_rx {
             if let Ok(res) = rx.try_recv() {
                 self.export_in_progress = false;
+                self.export_progress_rx = None;
                 match res {
                     Ok(p) => {
-                        self.export_status = format!("Exported: {}", p.file_name().unwrap().to_string_lossy());
+                        let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+                        let wav_name = p.with_extension("wav").file_name()
+                            .unwrap_or_default().to_string_lossy().to_string();
+                        self.export_status = format!("Exported {} (audio: {})", name, wav_name);
                     }
                     Err(e) => {
-                        self.export_status = format!("Failed: {}", e);
+                        self.export_status = format!("Export failed: {}", e);
                     }
                 }
                 self.export_rx = None;
@@ -145,7 +179,7 @@ impl eframe::App for SiloCutApp {
         let last_frame_state = self.state.clone();
 
         // Handle background updates for previews
-        self.preview.update(&mut self.state, ctx);
+        self.preview.update(&mut self.state, &ctx);
 
         // Check for drag-and-drop file ingestion
         ctx.input(|i| {
@@ -179,7 +213,7 @@ impl eframe::App for SiloCutApp {
         });
 
         // Capture keyboard hotkeys
-        if !ctx.wants_keyboard_input() {
+        if !ctx.egui_wants_keyboard_input() {
             // Space: Toggle Play/Pause
             if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
                 if self.state.is_playing {
@@ -224,8 +258,8 @@ impl eframe::App for SiloCutApp {
         }
 
         // Top Menu Bar
-        egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
-            egui::menu::bar(ui, |ui| {
+        egui::Panel::top("menu_bar").show_inside(ui, |ui| {
+            egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
                     if ui.button("Import Media...").clicked() {
                         if let Some(path) = rfd::FileDialog::new()
@@ -254,7 +288,7 @@ impl eframe::App for SiloCutApp {
                                 }
                             }
                         }
-                        ui.close_menu();
+                        ui.close();
                     }
                     ui.separator();
                     if ui.button("Exit").clicked() {
@@ -265,11 +299,11 @@ impl eframe::App for SiloCutApp {
                 ui.menu_button("Edit", |ui| {
                     if ui.add_enabled(!self.undo_stack.is_empty(), egui::Button::new("Undo (Ctrl+Z)")).clicked() {
                         self.undo();
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.add_enabled(!self.redo_stack.is_empty(), egui::Button::new("Redo (Ctrl+Y)")).clicked() {
                         self.redo();
-                        ui.close_menu();
+                        ui.close();
                     }
                     ui.separator();
                     if ui.button("Split Clip (Razor)").clicked() {
@@ -277,43 +311,43 @@ impl eframe::App for SiloCutApp {
                         if let Some((is_video, track_idx, clip_idx)) = self.state.selected_clip {
                             self.state.razor_at(is_video, track_idx, clip_idx, playhead);
                         }
-                        ui.close_menu();
+                        ui.close();
                     }
                 });
 
                 ui.menu_button("Export", |ui| {
                     if ui.button("Export Video & Audio...").clicked() {
                         self.show_export_dialog = true;
-                        ui.close_menu();
+                        ui.close();
                     }
                 });
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if self.export_in_progress {
                         ui.spinner();
-                        ui.label("Rendering output...");
+                        ui.label(format!("Rendering… {:.0}%", self.export_progress * 100.0));
                     } else if !self.export_status.is_empty() {
                         ui.label(&self.export_status);
                     } else {
-                        ui.label("SiloCut v1.0");
+                        ui.label("SiloCut v1.4");
                     }
                 });
             });
         });
 
         // Bottom Timeline Panel
-        egui::TopBottomPanel::bottom("timeline_panel")
+        egui::Panel::bottom("timeline_panel")
             .resizable(true)
-            .default_height(250.0)
-            .show(ctx, |ui| {
+            .default_size(250.0)
+            .show_inside(ui, |ui| {
                 timeline_ui::show_timeline(ui, &mut self.state);
             });
 
         // Left Panel - Media Bin
-        egui::SidePanel::left("media_bin_panel")
+        egui::Panel::left("media_bin_panel")
             .resizable(true)
-            .default_width(280.0)
-            .show(ctx, |ui| {
+            .default_size(280.0)
+            .show_inside(ui, |ui| {
                 ui.heading("Project Media Bin");
                 ui.separator();
 
@@ -439,7 +473,7 @@ impl eframe::App for SiloCutApp {
                                         }
                                         self.state.audio_tracks[0].clips.push(clip);
                                     }
-                                    ui.close_menu();
+                                    ui.close();
                                 }
                             });
                             
@@ -457,7 +491,7 @@ impl eframe::App for SiloCutApp {
             });
 
         // Central Panel - Preview Viewport
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show_inside(ui, |ui| {
             ui.heading("Preview Viewport");
             ui.separator();
 
@@ -529,7 +563,7 @@ impl eframe::App for SiloCutApp {
             egui::Window::new("Export Settings")
                 .collapsible(false)
                 .resizable(false)
-                .show(ctx, |ui| {
+                .show(&ctx, |ui| {
                     egui::Grid::new("export_grid").show(ui, |ui| {
                         ui.label("Resolution:");
                         ui.horizontal(|ui| {
@@ -586,10 +620,16 @@ impl eframe::App for SiloCutApp {
 
                             let (tx, rx) = std::sync::mpsc::channel();
                             self.export_rx = Some(rx);
+                            let (ptx, prx) = std::sync::mpsc::channel();
+                            self.export_progress_rx = Some(prx);
+                            self.export_progress = 0.0;
 
                             // Run export in background thread
                             std::thread::spawn(move || {
-                                let res = export::export_timeline(&state_clone, &path_clone, width, height, fps);
+                                let res = export::export_timeline(
+                                    &state_clone, &path_clone, width, height, fps,
+                                    |p| { let _ = ptx.send(p); },
+                                );
                                 let _ = tx.send(res.map(|_| path_clone));
                             });
                             self.show_export_dialog = false;
@@ -598,17 +638,30 @@ impl eframe::App for SiloCutApp {
                 });
         }
 
-        // Compare states to see if we need to push to undo stack
-        let state_modified = self.state.video_tracks != last_frame_state.video_tracks
-            || self.state.audio_tracks != last_frame_state.audio_tracks
-            || self.state.assets.len() != last_frame_state.assets.len()
-            || self.state.next_clip_id != last_frame_state.next_clip_id
-            || self.state.next_track_id != last_frame_state.next_track_id;
+        // --- Undo/redo bookkeeping ---
+        // Coalesce a continuous drag into one undo entry: snapshot state at the start
+        // of a pointer interaction and commit it only on release. Discrete changes
+        // (menu actions, keyboard shortcuts) are committed immediately. In all cases
+        // we record the *pre-change* state so the first undo actually reverts.
+        let pointer_down = ctx.input(|i| i.pointer.primary_down());
 
-        if state_modified && !self.skip_undo_save {
-            self.save_state_to_undo();
+        if self.skip_undo_save {
+            // An undo/redo restored state this frame — don't re-record it.
+            self.skip_undo_save = false;
+            self.interaction_baseline = None;
+        } else if pointer_down {
+            if self.interaction_baseline.is_none() {
+                self.interaction_baseline = Some(last_frame_state);
+            }
+        } else if let Some(baseline) = self.interaction_baseline.take() {
+            // A drag/click interaction just ended; record one entry if it changed.
+            if Self::timeline_differs(&baseline, &self.state) {
+                self.push_undo_state(baseline);
+            }
+        } else if Self::timeline_differs(&last_frame_state, &self.state) {
+            // Discrete (non-pointer) change such as a keyboard shortcut.
+            self.push_undo_state(last_frame_state);
         }
-        self.skip_undo_save = false; // Reset for the next frame
     }
 }
 

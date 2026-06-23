@@ -39,10 +39,10 @@ pub struct PreviewEngine {
     cmd_tx: Sender<DecoderCommand>,
     resp_rx: Receiver<DecodedFrameResponse>,
     
-    // Rodio audio objects
+    // Rodio audio objects. `_audio_stream` is held only to keep the output device
+    // alive for the lifetime of the engine (dropping it would stop playback).
     audio_sink: Option<rodio::Sink>,
     _audio_stream: Option<rodio::OutputStream>,
-    audio_stream_handle: Option<rodio::OutputStreamHandle>,
     last_audio_queue_time: f64,
 }
 
@@ -87,23 +87,6 @@ fn yuv420p_to_rgba(
         });
 }
 
-// Convert AVCC length-prefixed NAL units to Annex B start codes
-fn avcc_to_annex_b(data: &mut [u8]) {
-    if data.len() >= 4 && (data[0..4] == [0, 0, 0, 1] || data[0..3] == [0, 0, 1]) {
-        return; // Already Annex B
-    }
-    let mut i = 0;
-    while i + 4 <= data.len() {
-        let len = u32::from_be_bytes([data[i], data[i+1], data[i+2], data[i+3]]) as usize;
-        if i + 4 + len <= data.len() {
-            data[i..i+4].copy_from_slice(&[0, 0, 0, 1]);
-            i += 4 + len;
-        } else {
-            break;
-        }
-    }
-}
-
 impl PreviewEngine {
     pub fn new() -> Self {
         let (cmd_tx, cmd_rx) = channel::<DecoderCommand>();
@@ -116,6 +99,8 @@ impl PreviewEngine {
             let mut decoder: Option<Decoder> = None;
             let mut video_track_id: Option<u32> = None;
             let mut time_base: Option<symphonia_core::units::TimeBase> = None;
+            let mut header_annexb: Vec<u8> = Vec::new();
+            let mut nal_length_size: usize = 4;
             let mut last_decoded_secs = -999.0f64;
 
             while let Ok(mut cmd) = cmd_rx.recv() {
@@ -134,34 +119,35 @@ impl PreviewEngine {
                             decoder = None;
                             video_track_id = None;
                             time_base = None;
-                            
+                            header_annexb = Vec::new();
+                            nal_length_size = 4;
+
                             if let Ok(file) = std::fs::File::open(&path) {
                                 let mss = MediaSourceStream::new(Box::new(file), Default::default());
                                 let mut hint = Hint::new();
                                 if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                                     hint.with_extension(ext);
                                 }
-                                
-                                if let Ok(probed) = symphonia::default::get_probe().probe(
+
+                                if let Ok(fmt) = symphonia::default::get_probe().probe(
                                     &hint, mss, FormatOptions::default(), MetadataOptions::default()
                                 ) {
-                                    let fmt = probed;
-                                    for t in fmt.tracks() {
-                                        if let Some(symphonia::core::codecs::CodecParameters::Video(ref video_params)) = t.codec_params {
-                                            if video_params.width.is_some() && video_params.height.is_some() {
-                                                video_track_id = Some(t.id);
-                                                time_base = Some(t.time_base.unwrap_or_else(|| {
-                                                    symphonia_core::units::TimeBase::new(
-                                                        std::num::NonZeroU32::new(1).unwrap(),
-                                                        std::num::NonZeroU32::new(30).unwrap(),
-                                                    )
-                                                }));
-                                                break;
-                                            }
-                                        }
+                                    if let Some(info) = crate::codec::find_video_track(&*fmt) {
+                                        video_track_id = Some(info.track_id);
+                                        time_base = Some(info.time_base);
+                                        header_annexb = info.annexb_header;
+                                        nal_length_size = info.nal_length_size;
                                     }
                                     format = Some(fmt);
-                                    decoder = Decoder::new().ok();
+                                    if let Ok(mut new_dec) = Decoder::new() {
+                                        // Prime the decoder with SPS/PPS so the first
+                                        // frame can be decoded (MP4 stores these in the
+                                        // avcC box, not inline with the samples).
+                                        if !header_annexb.is_empty() {
+                                            let _ = new_dec.decode(&header_annexb);
+                                        }
+                                        decoder = Some(new_dec);
+                                    }
                                 }
                             }
                         }
@@ -176,11 +162,15 @@ impl PreviewEngine {
                         let tb = time_base.unwrap();
 
                         if need_seek {
-                            // Reset Decoder to clear DPB/state
-                            if let Ok(new_dec) = Decoder::new() {
+                            // Reset decoder to clear the decoded-picture buffer, then
+                            // re-prime with SPS/PPS (the reset discards them).
+                            if let Ok(mut new_dec) = Decoder::new() {
+                                if !header_annexb.is_empty() {
+                                    let _ = new_dec.decode(&header_annexb);
+                                }
                                 *dec = new_dec;
                             }
-                            
+
                             let seek_ts = target_secs * (tb.denom.get() as f64) / (tb.numer.get() as f64);
                             let _ = fmt.seek(
                                 SeekMode::Coarse,
@@ -200,9 +190,7 @@ impl PreviewEngine {
                             match fmt.next_packet() {
                                 Ok(Some(packet)) => {
                                     if packet.track_id == vid_id {
-                                        let mut data = packet.data;
-                                        avcc_to_annex_b(&mut data);
-                                        
+                                        let data = crate::codec::to_annex_b(&packet.data, nal_length_size);
                                         if let Ok(Some(yuv)) = dec.decode(&data) {
                                             let pts_secs = packet.pts.get() as f64 * (tb.numer.get() as f64) / (tb.denom.get() as f64);
                                             last_decoded_secs = pts_secs;
@@ -252,12 +240,10 @@ impl PreviewEngine {
         // Initialize Rodio dynamic audio output
         let mut audio_sink = None;
         let mut audio_stream = None;
-        let mut audio_stream_handle = None;
         if let Ok((stream, stream_handle)) = rodio::OutputStream::try_default() {
             if let Ok(sink) = rodio::Sink::try_new(&stream_handle) {
                 audio_sink = Some(sink);
                 audio_stream = Some(stream);
-                audio_stream_handle = Some(stream_handle);
             }
         }
 
@@ -270,7 +256,6 @@ impl PreviewEngine {
             resp_rx,
             audio_sink,
             _audio_stream: audio_stream,
-            audio_stream_handle,
             last_audio_queue_time: 0.0,
         }
     }

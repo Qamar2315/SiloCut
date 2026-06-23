@@ -13,7 +13,9 @@ SiloCut is an ultra-lightweight, zero-dependency standalone Non-Linear Video Edi
 - **Standalone Single Binary**: Zero external system dependencies, no installers, no FFmpeg DLL installations. Just download the `.exe` and run.
 - **Built-in GDI Screen Recorder**:
   - Zero-watermark, zero-dependency, full-resolution Windows screen capture.
+  - Captures the mouse cursor and records at wall-clock-accurate speed (no sped-up playback when capture can't keep up).
   - Rayon-accelerated BGRA-to-RGB conversion for maximum CPU utilization.
+  - Resolution-scaled H.264 bitrate with periodic keyframes for sharp, seekable output.
   - On-the-fly H.264 compression and MP4 muxing.
   - Automatically imports finished recordings directly into the Project Media Bin for immediate editing.
 - **Responsive egui UI**: Smooth GPU-accelerated editor interface with a timeline ruler, drag-and-drop media ingestion, and layout resizing.
@@ -25,7 +27,7 @@ SiloCut is an ultra-lightweight, zero-dependency standalone Non-Linear Video Edi
 - **Asynchronous Audio Decoding**: Non-blocking ingestion that decodes audio samples in background worker threads, preventing GUI freezes.
 - **Real-Time Preview Engine**: Decoupled background video decoding thread that converts YUV420p to RGBA using CPU-optimized integer math.
 - **Dynamic Audio Mixing**: Real-time multi-track mixer that dynamically queries the timeline, mixes overlapping samples, and plays them via `rodio`.
-- **H.264 MP4 Exporter**: Decodes source clips sequentially, resizes them, encodes them using OpenH264, and packages them into a valid MP4 stream via a pure-Rust muxer.
+- **H.264 MP4 Exporter**: Decodes source clips sequentially, resizes them, encodes them using OpenH264, and packages them into a valid MP4 stream via a pure-Rust muxer, with a live progress indicator. The mixed timeline audio is rendered to a companion `.wav` file alongside the exported `.mp4`.
 
 ---
 
@@ -79,8 +81,14 @@ cargo build --release
 The compiled standalone executable will be located at:
 `target/release/silocut.exe` (on Windows).
 
-- **Binary Size**: **10.71 MB** (fully optimized using LTO, symbol stripping, and size-optimized profiles).
+- **Binary Size**: **~10.9 MB** (fully optimized using LTO, symbol stripping, and size-optimized profiles).
 - **Application Icon**: Embedded natively in the `.exe` file using `winres`.
+
+---
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for release notes. The latest release (**v1.4.0**) fixes the screen recorder, video preview, and export so they produce usable output, and adds cursor capture, accurate recording timing, and export progress.
 
 ---
 

@@ -33,10 +33,10 @@ impl MediaAsset {
             hint.with_extension(ext);
         }
         
-        let mut format = symphonia::default::get_probe()
+        let format = symphonia::default::get_probe()
             .probe(&hint, mss, FormatOptions::default(), MetadataOptions::default())
             .map_err(|e| format!("Failed to probe file: {}", e))?;
-        
+
         // Find video and audio tracks
         let mut video_track = None;
         let mut audio_track = None;
@@ -75,12 +75,20 @@ impl MediaAsset {
                 width = video_params.width.unwrap_or(0) as u32;
                 height = video_params.height.unwrap_or(0) as u32;
             }
+            // `time_base` for MP4 is 1/timescale (e.g. 1/90000), so denom/numer is the
+            // timescale, not the frame rate. Only trust it when it lands in a plausible
+            // FPS range; otherwise fall back to 30.
             fps = vt.time_base
                 .map(|tb| tb.denom.get() as f64 / tb.numer.get() as f64)
+                .filter(|f| (1.0..=240.0).contains(f))
                 .unwrap_or(30.0);
-                
-            if let (Some(tb), Some(num_frames)) = (vt.time_base, vt.num_frames) {
-                duration_secs = num_frames as f64 * (tb.numer.get() as f64) / (tb.denom.get() as f64);
+
+            // Duration must come from the `duration` field (in timebase ticks):
+            // symphonia leaves `num_frames` unset for video tracks, so the previous
+            // num_frames-based calculation always yielded 0 for video-only files
+            // (e.g. screen recordings), producing zero-length clips.
+            if let (Some(tb), Some(dur)) = (vt.time_base, vt.duration) {
+                duration_secs = dur.get() as f64 * tb.numer.get() as f64 / tb.denom.get() as f64;
             }
         }
         
@@ -95,8 +103,8 @@ impl MediaAsset {
                     .unwrap_or(0);
                 audio_sample_rate = audio_params.sample_rate.unwrap_or(0);
                 
-                if let (Some(tb), Some(num_frames)) = (at.time_base, at.num_frames) {
-                    let d = num_frames as f64 * (tb.numer.get() as f64) / (tb.denom.get() as f64);
+                if let (Some(tb), Some(dur)) = (at.time_base, at.duration) {
+                    let d = dur.get() as f64 * tb.numer.get() as f64 / tb.denom.get() as f64;
                     if !is_video {
                         duration_secs = d;
                     }
@@ -106,8 +114,8 @@ impl MediaAsset {
         
         if duration_secs == 0.0 {
             for track in format.tracks() {
-                if let (Some(tb), Some(num_frames)) = (track.time_base, track.num_frames) {
-                    let d = num_frames as f64 * (tb.numer.get() as f64) / (tb.denom.get() as f64);
+                if let (Some(tb), Some(dur)) = (track.time_base, track.duration) {
+                    let d = dur.get() as f64 * tb.numer.get() as f64 / tb.denom.get() as f64;
                     if d > duration_secs {
                         duration_secs = d;
                     }

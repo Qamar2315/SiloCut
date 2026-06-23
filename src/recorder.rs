@@ -2,7 +2,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::path::PathBuf;
 use std::time::{Instant, Duration};
-use openh264::encoder::Encoder;
 use openh264::formats::YUVBuffer;
 use rayon::prelude::*;
 
@@ -13,8 +12,37 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN,
+    GetCursorInfo, GetIconInfo, DrawIconEx, CURSORINFO, ICONINFO, CURSOR_SHOWING, DI_NORMAL,
 };
 use windows_sys::Win32::Foundation::HWND;
+
+/// Composites the current mouse cursor onto `hdc` at its on-screen position so the
+/// recording includes the pointer. Best-effort: does nothing if the cursor is
+/// hidden or can't be queried.
+unsafe fn draw_cursor_onto(hdc: HDC) {
+    let mut ci: CURSORINFO = std::mem::zeroed();
+    ci.cbSize = std::mem::size_of::<CURSORINFO>() as u32;
+    if GetCursorInfo(&mut ci) == 0 || ci.flags != CURSOR_SHOWING {
+        return;
+    }
+
+    let mut icon_info: ICONINFO = std::mem::zeroed();
+    if GetIconInfo(ci.hCursor, &mut icon_info) == 0 {
+        return;
+    }
+
+    let x = ci.ptScreenPos.x - icon_info.xHotspot as i32;
+    let y = ci.ptScreenPos.y - icon_info.yHotspot as i32;
+    DrawIconEx(hdc, x, y, ci.hCursor, 0, 0, 0, 0, DI_NORMAL);
+
+    // GetIconInfo creates bitmaps the caller must free.
+    if icon_info.hbmMask != 0 {
+        DeleteObject(icon_info.hbmMask as HGDIOBJ);
+    }
+    if icon_info.hbmColor != 0 {
+        DeleteObject(icon_info.hbmColor as HGDIOBJ);
+    }
+}
 
 struct GdiCaptureGuard {
     hwnd: HWND,
@@ -115,8 +143,10 @@ impl ScreenRecorder {
             let mut muxer = mp4e::Mp4e::new(&mut writer);
             muxer.set_video_track(width as u32, height as u32, mp4e::Codec::AVC);
 
-            // Setup H.264 Encoder
-            let mut encoder = Encoder::new().map_err(|e| format!("Encoder error: {}", e))?;
+            // Setup H.264 Encoder tuned for screen capture. The OpenH264 default
+            // (120 kbps, frame-skipping on, no periodic keyframes) is unusable for
+            // full-screen recording; see `codec::build_encoder`.
+            let mut encoder = crate::codec::build_encoder(width as u32, height as u32, fps, true)?;
 
             // Bitmap Info Header for GetDIBits
             let mut bmi = BITMAPINFO {
@@ -142,7 +172,11 @@ impl ScreenRecorder {
             let mut bitstream_buffer = Vec::new();
 
             let frame_duration = Duration::from_secs_f64(1.0 / fps as f64);
-            let frame_duration_ms = 1000 / fps;
+
+            // Track real wall-clock time between captured frames so the recording
+            // plays back at the correct speed even when capture/encoding can't keep
+            // up with the target FPS (otherwise the video would appear sped up).
+            let mut prev_capture = Instant::now();
 
             while is_recording.load(Ordering::SeqCst) {
                 let frame_start = Instant::now();
@@ -156,6 +190,9 @@ impl ScreenRecorder {
                         0, 0,
                         SRCCOPY,
                     );
+
+                    // Composite the mouse cursor into the captured frame.
+                    draw_cursor_onto(hdc_mem);
 
                     GetDIBits(
                         hdc_mem,
@@ -182,12 +219,18 @@ impl ScreenRecorder {
                     openh264::formats::RgbSliceU8::new(&rgb_buffer, (width, height))
                 );
 
-                // 4. H.264 encode and mux
+                // 4. H.264 encode and mux, tagging the frame with the real elapsed
+                //    time since the previous captured frame.
                 if let Ok(bitstream) = encoder.encode(&yuv_buffer) {
                     bitstream_buffer.clear();
                     bitstream.write_vec(&mut bitstream_buffer);
-                    muxer.encode_video(&bitstream_buffer, frame_duration_ms)
-                        .map_err(|e| format!("Muxer error: {}", e))?;
+                    if !bitstream_buffer.is_empty() {
+                        let now = Instant::now();
+                        let dur_ms = (now - prev_capture).as_millis().max(1) as u32;
+                        prev_capture = now;
+                        muxer.encode_video(&bitstream_buffer, dur_ms)
+                            .map_err(|e| format!("Muxer error: {}", e))?;
+                    }
                 }
 
                 // 5. Pacing: sleep to maintain FPS
@@ -226,5 +269,73 @@ impl ScreenRecorder {
 
     pub fn is_recording(&self) -> bool {
         self.is_recording.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Records the real screen for ~1.2s and verifies the result is a valid,
+    /// non-zero-duration, decodable MP4. Ignored by default because it requires an
+    /// interactive desktop session (GDI screen capture); run with
+    /// `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn record_screen_produces_decodable_video() {
+        let tmp = std::env::temp_dir().join(format!("silocut_rec_test_{}.mp4", std::process::id()));
+
+        let mut rec = ScreenRecorder::new();
+        rec.start(tmp.clone(), 15).expect("start recording");
+        std::thread::sleep(Duration::from_millis(1200));
+        let path = rec.stop().expect("stop recording");
+
+        assert!(path.exists(), "recording file should exist");
+        let size = std::fs::metadata(&path).unwrap().len();
+        assert!(size > 1000, "recording suspiciously small: {size} bytes");
+
+        // media.rs must report a non-zero duration for this video-only MP4 (the bug
+        // that previously made recordings un-editable).
+        let asset = crate::media::MediaAsset::load_metadata(0, &path).expect("load metadata");
+        assert!(asset.is_video, "should be detected as a video asset");
+        assert!(asset.duration_secs > 0.0, "duration must be > 0, got {}", asset.duration_secs);
+        assert!(asset.width >= 2 && asset.height >= 2, "bad dims {}x{}", asset.width, asset.height);
+
+        // The MP4 must decode through the exact path the editor preview/export use.
+        let file = std::fs::File::open(&path).unwrap();
+        let mss = symphonia::core::io::MediaSourceStream::new(Box::new(file), Default::default());
+        let mut hint = symphonia::core::formats::probe::Hint::new();
+        hint.with_extension("mp4");
+        let mut fmt = symphonia::default::get_probe()
+            .probe(
+                &hint,
+                mss,
+                symphonia::core::formats::FormatOptions::default(),
+                symphonia::core::meta::MetadataOptions::default(),
+            )
+            .expect("probe recording");
+        let info = crate::codec::find_video_track(&*fmt).expect("video track in recording");
+
+        let mut dec = openh264::decoder::Decoder::new().unwrap();
+        if !info.annexb_header.is_empty() {
+            let _ = dec.decode(&info.annexb_header);
+        }
+        let mut decoded = 0;
+        while let Ok(Some(pkt)) = fmt.next_packet() {
+            if pkt.track_id != info.track_id {
+                continue;
+            }
+            let annexb = crate::codec::to_annex_b(&pkt.data, info.nal_length_size);
+            if let Ok(Some(_)) = dec.decode(&annexb) {
+                decoded += 1;
+            }
+        }
+
+        let _ = std::fs::remove_file(&path);
+        assert!(decoded > 0, "no frames decoded from the screen recording");
+        eprintln!(
+            "recorded {:.2}s, {}x{}, {} bytes, decoded {} frames",
+            asset.duration_secs, asset.width, asset.height, size, decoded
+        );
     }
 }

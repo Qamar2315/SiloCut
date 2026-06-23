@@ -5,7 +5,6 @@ use symphonia::core::formats::{FormatReader, FormatOptions};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::formats::probe::Hint;
-use openh264::encoder::Encoder;
 use openh264::formats::YUVBuffer;
 use image::{ImageBuffer, Rgb};
 
@@ -15,6 +14,8 @@ struct AssetExportDecoder {
     video_track_id: u32,
     decoder: openh264::decoder::Decoder,
     time_base: symphonia_core::units::TimeBase,
+    header_annexb: Vec<u8>,
+    nal_length_size: usize,
     last_pts: u64,
 }
 
@@ -26,41 +27,26 @@ impl AssetExportDecoder {
         if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
             hint.with_extension(ext);
         }
-        let probed = symphonia::default::get_probe()
+        let format_reader = symphonia::default::get_probe()
             .probe(&hint, mss, FormatOptions::default(), MetadataOptions::default())
             .map_err(|e| e.to_string())?;
-        
-        let format_reader = probed;
-        
-        // Find video track and its time base
-        let mut video_track_id = None;
-        let mut time_base = None;
-        
-        for t in format_reader.tracks() {
-            if let Some(symphonia::core::codecs::CodecParameters::Video(ref video_params)) = t.codec_params {
-                if video_params.width.is_some() && video_params.height.is_some() {
-                    video_track_id = Some(t.id);
-                    time_base = Some(t.time_base.unwrap_or_else(|| {
-                        symphonia_core::units::TimeBase::new(
-                            std::num::NonZeroU32::new(1).unwrap(),
-                            std::num::NonZeroU32::new(30).unwrap(),
-                        )
-                    }));
-                    break;
-                }
-            }
-        }
-        
-        let video_track_id = video_track_id.ok_or_else(|| format!("No video track found in {}", path.display()))?;
-        let time_base = time_base.unwrap();
 
-        let decoder = openh264::decoder::Decoder::new().map_err(|e| e.to_string())?;
+        let info = crate::codec::find_video_track(&*format_reader)
+            .ok_or_else(|| format!("No video track found in {}", path.display()))?;
+
+        let mut decoder = openh264::decoder::Decoder::new().map_err(|e| e.to_string())?;
+        // Prime the decoder with SPS/PPS up front so the first frame decodes.
+        if !info.annexb_header.is_empty() {
+            let _ = decoder.decode(&info.annexb_header);
+        }
 
         Ok(Self {
             format_reader,
-            video_track_id,
+            video_track_id: info.track_id,
             decoder,
-            time_base,
+            time_base: info.time_base,
+            header_annexb: info.annexb_header,
+            nal_length_size: info.nal_length_size,
             last_pts: 0,
         })
     }
@@ -89,8 +75,13 @@ impl AssetExportDecoder {
                     }
                 );
             }
-            // Reset decoder states on seek to ensure clean decoding starting from keyframe
-            self.decoder = openh264::decoder::Decoder::new().map_err(|e| e.to_string())?;
+            // Reset decoder state on seek for clean decoding from the keyframe, then
+            // re-prime with SPS/PPS (lost on reset).
+            let mut new_dec = openh264::decoder::Decoder::new().map_err(|e| e.to_string())?;
+            if !self.header_annexb.is_empty() {
+                let _ = new_dec.decode(&self.header_annexb);
+            }
+            self.decoder = new_dec;
             self.last_pts = 0;
         }
 
@@ -108,10 +99,7 @@ impl AssetExportDecoder {
                     let packet_time = packet.pts.get() as f64 * self.time_base.numer.get() as f64 / self.time_base.denom.get() as f64;
 
                     // Decode H.264 frame
-                    let mut data = packet.data;
-                    avcc_to_annex_b(&mut data);
-                    
-                    // To satisfy borrow checker, we must only return owned values
+                    let data = crate::codec::to_annex_b(&packet.data, self.nal_length_size);
                     if let Ok(Some(decoded)) = self.decoder.decode(&data) {
                         if packet_time >= target_time_secs - 0.04 {
                             use openh264::formats::YUVSource;
@@ -241,7 +229,14 @@ fn mix_track_audio(
     }
 }
 
-pub fn export_timeline(state: &EditorState, path: &Path, width: u32, height: u32, fps: u32) -> Result<(), String> {
+pub fn export_timeline(
+    state: &EditorState,
+    path: &Path,
+    width: u32,
+    height: u32,
+    fps: u32,
+    progress: impl Fn(f32),
+) -> Result<(), String> {
     // Determine export duration
     let mut max_duration = 0.0f64;
     for track in &state.video_tracks {
@@ -297,8 +292,9 @@ pub fn export_timeline(state: &EditorState, path: &Path, width: u32, height: u32
     let mut muxer = mp4e::Mp4e::new(&mut writer);
     muxer.set_video_track(width, height, mp4e::Codec::AVC);
 
-    // Set up H.264 Encoder
-    let mut encoder = Encoder::new().map_err(|e| e.to_string())?;
+    // Set up H.264 Encoder. The OpenH264 default (120 kbps) would render the export
+    // unwatchable; codec::build_encoder scales the bitrate to the resolution.
+    let mut encoder = crate::codec::build_encoder(width, height, fps, false)?;
     let mut bitstream_buffer = Vec::new();
 
     // Cache of open asset decoders
@@ -308,6 +304,9 @@ pub fn export_timeline(state: &EditorState, path: &Path, width: u32, height: u32
     let frame_duration_ms = 1000 / fps;
 
     for frame_idx in 0..total_frames {
+        if total_frames > 0 {
+            progress(frame_idx as f32 / total_frames as f32);
+        }
         let time_secs = frame_idx as f64 / fps as f64;
 
         // Find active clip with the highest track priority (top-most video track)
@@ -410,20 +409,6 @@ pub fn export_timeline(state: &EditorState, path: &Path, width: u32, height: u32
     }
 
     muxer.flush().map_err(|e| e.to_string())?;
+    progress(1.0);
     Ok(())
-}
-
-fn avcc_to_annex_b(data: &mut [u8]) {
-    if data.len() >= 4 && !(data[0..4] == [0, 0, 0, 1] || data[0..3] == [0, 0, 1]) {
-        let mut i = 0;
-        while i + 4 <= data.len() {
-            let len = u32::from_be_bytes([data[i], data[i+1], data[i+2], data[i+3]]) as usize;
-            if i + 4 + len <= data.len() {
-                data[i..i+4].copy_from_slice(&[0, 0, 0, 1]);
-                i += 4 + len;
-            } else {
-                break;
-            }
-        }
-    }
 }
