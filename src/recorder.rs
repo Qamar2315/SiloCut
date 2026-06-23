@@ -72,6 +72,7 @@ impl Drop for RecordingGuard {
 
 pub struct ScreenRecorder {
     is_recording: Arc<AtomicBool>,
+    is_paused: Arc<AtomicBool>,
     thread_handle: Option<std::thread::JoinHandle<Result<PathBuf, String>>>,
 }
 
@@ -79,23 +80,39 @@ impl ScreenRecorder {
     pub fn new() -> Self {
         Self {
             is_recording: Arc::new(AtomicBool::new(false)),
+            is_paused: Arc::new(AtomicBool::new(false)),
             thread_handle: None,
         }
     }
 
-    pub fn start(&mut self, output_path: PathBuf, fps: u32) -> Result<(), String> {
+    /// Start recording. `region` is the capture rectangle in virtual-screen
+    /// coordinates `(x, y, w, h)`; `None` captures the primary monitor.
+    pub fn start(
+        &mut self,
+        output_path: PathBuf,
+        fps: u32,
+        region: Option<(i32, i32, i32, i32)>,
+    ) -> Result<(), String> {
         if self.is_recording.load(Ordering::SeqCst) {
             return Err("Recording is already in progress.".to_string());
         }
 
         let is_recording = self.is_recording.clone();
+        let is_paused = self.is_paused.clone();
+        is_paused.store(false, Ordering::SeqCst);
         is_recording.store(true, Ordering::SeqCst);
 
         let handle = std::thread::spawn(move || -> Result<PathBuf, String> {
             let _recording_guard = RecordingGuard(is_recording.clone());
-            let width = unsafe { GetSystemMetrics(SM_CXSCREEN) } as usize;
-            let height = unsafe { GetSystemMetrics(SM_CYSCREEN) } as usize;
-            
+            let (cap_x, cap_y, width, height) = match region {
+                Some((x, y, w, h)) => (x, y, w.max(2) as usize, h.max(2) as usize),
+                None => {
+                    let w = unsafe { GetSystemMetrics(SM_CXSCREEN) } as usize;
+                    let h = unsafe { GetSystemMetrics(SM_CYSCREEN) } as usize;
+                    (0, 0, w, h)
+                }
+            };
+
             // Width and height must be even for OpenH264 encoding
             let width = width & !1;
             let height = height & !1;
@@ -181,13 +198,21 @@ impl ScreenRecorder {
             while is_recording.load(Ordering::SeqCst) {
                 let frame_start = Instant::now();
 
+                // While paused, capture nothing and don't count the elapsed time
+                // toward the next frame's duration.
+                if is_paused.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(30));
+                    prev_capture = Instant::now();
+                    continue;
+                }
+
                 // 1. GDI Capture
                 unsafe {
                     BitBlt(
                         hdc_mem,
                         0, 0, width as i32, height as i32,
                         hdc_screen,
-                        0, 0,
+                        cap_x, cap_y,
                         SRCCOPY,
                     );
 
@@ -270,6 +295,18 @@ impl ScreenRecorder {
     pub fn is_recording(&self) -> bool {
         self.is_recording.load(Ordering::SeqCst)
     }
+
+    pub fn pause(&self) {
+        self.is_paused.store(true, Ordering::SeqCst);
+    }
+
+    pub fn resume(&self) {
+        self.is_paused.store(false, Ordering::SeqCst);
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.is_paused.load(Ordering::SeqCst)
+    }
 }
 
 #[cfg(test)]
@@ -286,7 +323,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("silocut_rec_test_{}.mp4", std::process::id()));
 
         let mut rec = ScreenRecorder::new();
-        rec.start(tmp.clone(), 15).expect("start recording");
+        rec.start(tmp.clone(), 15, None).expect("start recording");
         std::thread::sleep(Duration::from_millis(1200));
         let path = rec.stop().expect("stop recording");
 

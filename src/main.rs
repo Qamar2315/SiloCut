@@ -16,6 +16,10 @@ struct SiloCutApp {
     state: EditorState,
     preview: PreviewEngine,
     recorder: recorder::ScreenRecorder,
+    record_fps: u32,
+    record_countdown: Option<std::time::Instant>,
+    pending_record_path: Option<PathBuf>,
+    recording_started: Option<std::time::Instant>,
     export_in_progress: bool,
     export_status: String,
     show_export_dialog: bool,
@@ -61,6 +65,10 @@ impl SiloCutApp {
             state: EditorState::new(),
             preview: PreviewEngine::new(),
             recorder: recorder::ScreenRecorder::new(),
+            record_fps: 30,
+            record_countdown: None,
+            pending_record_path: None,
+            recording_started: None,
             export_in_progress: false,
             export_status: String::new(),
             show_export_dialog: false,
@@ -218,7 +226,11 @@ impl eframe::App for SiloCutApp {
         // ctx-level calls while passing `ui` mutably to the panels' `show_inside`.
         let ctx = ui.ctx().clone();
 
-        if self.recorder.is_recording() || !self.decoding_assets.is_empty() || self.export_in_progress {
+        if self.recorder.is_recording()
+            || !self.decoding_assets.is_empty()
+            || self.export_in_progress
+            || self.record_countdown.is_some()
+        {
             ctx.request_repaint();
         }
 
@@ -503,19 +515,39 @@ impl eframe::App for SiloCutApp {
                 // Screen Recorder Section
                 ui.group(|ui| {
                     ui.label(egui::RichText::new("Screen Recorder").strong());
-                    ui.horizontal(|ui| {
-                        if self.recorder.is_recording() {
-                            // Flashing red dot
+
+                    if self.recorder.is_recording() {
+                        ui.horizontal(|ui| {
+                            // Flashing status dot.
                             let time = ui.input(|i| i.time);
                             let alpha = (((time * 5.0).sin() + 1.0) * 127.5) as u8;
                             let dot_color = egui::Color32::from_rgba_unmultiplied(239, 68, 68, alpha);
-                            
                             let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
                             ui.painter().circle_filled(rect.center(), 5.0, dot_color);
-                            
-                            ui.label(egui::RichText::new("REC").color(egui::Color32::from_rgb(239, 68, 68)).strong());
-                            
-                            if ui.button("Stop").clicked() {
+
+                            let paused = self.recorder.is_paused();
+                            let (label, col) = if paused {
+                                ("PAUSED", egui::Color32::from_rgb(250, 190, 60))
+                            } else {
+                                ("REC", egui::Color32::from_rgb(239, 68, 68))
+                            };
+                            ui.label(egui::RichText::new(label).color(col).strong());
+                            if let Some(start) = self.recording_started {
+                                let s = start.elapsed().as_secs();
+                                ui.monospace(format!("{:02}:{:02}", s / 60, s % 60));
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            let pause_label = if self.recorder.is_paused() { "▶ Resume" } else { "⏸ Pause" };
+                            if ui.button(pause_label).clicked() {
+                                if self.recorder.is_paused() {
+                                    self.recorder.resume();
+                                } else {
+                                    self.recorder.pause();
+                                }
+                            }
+                            if ui.button("⏹ Stop").clicked() {
+                                self.recording_started = None;
                                 match self.recorder.stop() {
                                     Ok(path) => {
                                         let next_id = self.state.assets.len();
@@ -534,22 +566,50 @@ impl eframe::App for SiloCutApp {
                                     }
                                 }
                             }
-                        } else {
-                            if ui.button("Start Recording").clicked() {
-                                if let Some(path) = rfd::FileDialog::new()
-                                    .add_filter("MP4 Video", &["mp4"])
-                                    .set_file_name("recording.mp4")
-                                    .save_file()
-                                {
-                                    if let Err(e) = self.recorder.start(path, 30) {
-                                        self.export_status = format!("Failed to start recording: {}", e);
-                                    } else {
+                        });
+                    } else if let Some(t) = self.record_countdown {
+                        let remaining = 3.0 - t.elapsed().as_secs_f64();
+                        if remaining <= 0.0 {
+                            self.record_countdown = None;
+                            if let Some(path) = self.pending_record_path.take() {
+                                match self.recorder.start(path, self.record_fps, None) {
+                                    Ok(()) => {
+                                        self.recording_started = Some(std::time::Instant::now());
                                         self.export_status = "Recording started...".to_string();
+                                    }
+                                    Err(e) => {
+                                        self.export_status = format!("Failed to start recording: {}", e);
                                     }
                                 }
                             }
+                        } else {
+                            ui.label(
+                                egui::RichText::new(format!("Recording in {}…", remaining.ceil() as i32))
+                                    .size(18.0)
+                                    .strong(),
+                            );
+                            if ui.button("Cancel").clicked() {
+                                self.record_countdown = None;
+                                self.pending_record_path = None;
+                            }
                         }
-                    });
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.label("FPS:");
+                            ui.radio_value(&mut self.record_fps, 30, "30");
+                            ui.radio_value(&mut self.record_fps, 60, "60");
+                        });
+                        if ui.button("● Start Recording").clicked() {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("MP4 Video", &["mp4"])
+                                .set_file_name("recording.mp4")
+                                .save_file()
+                            {
+                                self.pending_record_path = Some(path);
+                                self.record_countdown = Some(std::time::Instant::now());
+                            }
+                        }
+                    }
                 });
                 ui.separator();
 
