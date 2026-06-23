@@ -35,6 +35,13 @@ impl Drop for GdiCaptureGuard {
     }
 }
 
+struct RecordingGuard(Arc<AtomicBool>);
+impl Drop for RecordingGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 pub struct ScreenRecorder {
     is_recording: Arc<AtomicBool>,
     thread_handle: Option<std::thread::JoinHandle<Result<PathBuf, String>>>,
@@ -57,6 +64,7 @@ impl ScreenRecorder {
         is_recording.store(true, Ordering::SeqCst);
 
         let handle = std::thread::spawn(move || -> Result<PathBuf, String> {
+            let _recording_guard = RecordingGuard(is_recording.clone());
             let width = unsafe { GetSystemMetrics(SM_CXSCREEN) } as usize;
             let height = unsafe { GetSystemMetrics(SM_CYSCREEN) } as usize;
             
@@ -131,6 +139,7 @@ impl ScreenRecorder {
             // Preallocated buffers
             let mut bgra_buffer = vec![0u8; width * height * 4];
             let mut rgb_buffer = vec![0u8; width * height * 3];
+            let mut bitstream_buffer = Vec::new();
 
             let frame_duration = Duration::from_secs_f64(1.0 / fps as f64);
             let frame_duration_ms = 1000 / fps;
@@ -175,7 +184,9 @@ impl ScreenRecorder {
 
                 // 4. H.264 encode and mux
                 if let Ok(bitstream) = encoder.encode(&yuv_buffer) {
-                    muxer.encode_video(&bitstream.to_vec(), frame_duration_ms)
+                    bitstream_buffer.clear();
+                    bitstream.write_vec(&mut bitstream_buffer);
+                    muxer.encode_video(&bitstream_buffer, frame_duration_ms)
                         .map_err(|e| format!("Muxer error: {}", e))?;
                 }
 

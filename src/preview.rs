@@ -335,9 +335,10 @@ impl PreviewEngine {
                         let playhead = state.playhead_secs;
                         let mut alpha = 1.0f32;
                         if clip.fade_in_duration > 0.0 && (playhead - clip.timeline_start) < clip.fade_in_duration {
-                            alpha = ((playhead - clip.timeline_start) / clip.fade_in_duration) as f32;
-                        } else if clip.fade_out_duration > 0.0 && (clip.timeline_end - playhead) < clip.fade_out_duration {
-                            alpha = ((clip.timeline_end - playhead) / clip.fade_out_duration) as f32;
+                            alpha *= ((playhead - clip.timeline_start) / clip.fade_in_duration) as f32;
+                        }
+                        if clip.fade_out_duration > 0.0 && (clip.timeline_end - playhead) < clip.fade_out_duration {
+                            alpha *= ((clip.timeline_end - playhead) / clip.fade_out_duration) as f32;
                         }
                         alpha = alpha.clamp(0.0, 1.0);
 
@@ -395,9 +396,10 @@ impl PreviewEngine {
                         let playhead = state.playhead_secs;
                         let mut alpha = 1.0f32;
                         if clip.fade_in_duration > 0.0 && (playhead - clip.timeline_start) < clip.fade_in_duration {
-                            alpha = ((playhead - clip.timeline_start) / clip.fade_in_duration) as f32;
-                        } else if clip.fade_out_duration > 0.0 && (clip.timeline_end - playhead) < clip.fade_out_duration {
-                            alpha = ((clip.timeline_end - playhead) / clip.fade_out_duration) as f32;
+                            alpha *= ((playhead - clip.timeline_start) / clip.fade_in_duration) as f32;
+                        }
+                        if clip.fade_out_duration > 0.0 && (clip.timeline_end - playhead) < clip.fade_out_duration {
+                            alpha *= ((clip.timeline_end - playhead) / clip.fade_out_duration) as f32;
                         }
                         alpha = alpha.clamp(0.0, 1.0);
 
@@ -429,7 +431,7 @@ impl PreviewEngine {
         if state.is_playing {
             if let Some(ref sink) = self.audio_sink {
                 // Handle seeking/drifting: reset audio playhead if it goes out of sync
-                if (state.playhead_secs - self.last_audio_queue_time).abs() > 0.4 {
+                if (state.playhead_secs - self.last_audio_queue_time).abs() > 0.8 {
                     sink.stop();
                     sink.play();
                     self.last_audio_queue_time = state.playhead_secs;
@@ -492,7 +494,8 @@ impl PreviewEngine {
                                                         let mut volume_factor = track.volume;
                                                         if clip.fade_in_duration > 0.0 && clip_offset < clip.fade_in_duration {
                                                             volume_factor *= (clip_offset / clip.fade_in_duration) as f32;
-                                                        } else if clip.fade_out_duration > 0.0 && (clip.timeline_end - t) < clip.fade_out_duration {
+                                                        }
+                                                        if clip.fade_out_duration > 0.0 && (clip.timeline_end - t) < clip.fade_out_duration {
                                                             volume_factor *= ((clip.timeline_end - t) / clip.fade_out_duration) as f32;
                                                         }
 
@@ -552,7 +555,8 @@ impl PreviewEngine {
                                                         let mut volume_factor = track.volume;
                                                         if clip.fade_in_duration > 0.0 && clip_offset < clip.fade_in_duration {
                                                             volume_factor *= (clip_offset / clip.fade_in_duration) as f32;
-                                                        } else if clip.fade_out_duration > 0.0 && (clip.timeline_end - t) < clip.fade_out_duration {
+                                                        }
+                                                        if clip.fade_out_duration > 0.0 && (clip.timeline_end - t) < clip.fade_out_duration {
                                                             volume_factor *= ((clip.timeline_end - t) / clip.fade_out_duration) as f32;
                                                         }
 

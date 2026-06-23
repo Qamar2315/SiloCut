@@ -30,6 +30,11 @@ struct SiloCutApp {
 
     // Channel receiver for background export thread
     export_rx: Option<std::sync::mpsc::Receiver<Result<PathBuf, String>>>,
+
+    // Asynchronous audio decoding channels
+    audio_decode_rx: std::sync::mpsc::Receiver<(usize, Result<Vec<f32>, String>)>,
+    audio_decode_tx: std::sync::mpsc::Sender<(usize, Result<Vec<f32>, String>)>,
+    decoding_assets: std::collections::HashSet<usize>,
 }
 
 impl SiloCutApp {
@@ -39,6 +44,8 @@ impl SiloCutApp {
         visuals.widgets.active.bg_fill = egui::Color32::from_rgb(99, 102, 241); // Indigo theme accent
         visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(79, 70, 229);
         cc.egui_ctx.set_visuals(visuals);
+
+        let (audio_decode_tx, audio_decode_rx) = std::sync::mpsc::channel();
 
         Self {
             state: EditorState::new(),
@@ -55,6 +62,9 @@ impl SiloCutApp {
             redo_stack: Vec::new(),
             skip_undo_save: false,
             export_rx: None,
+            audio_decode_rx,
+            audio_decode_tx,
+            decoding_assets: std::collections::HashSet::new(),
         }
     }
 
@@ -91,8 +101,28 @@ impl eframe::App for SiloCutApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx();
 
-        if self.recorder.is_recording() {
+        if self.recorder.is_recording() || !self.decoding_assets.is_empty() {
             ctx.request_repaint();
+        }
+
+        // Receive background audio decoding updates
+        while let Ok((asset_id, res)) = self.audio_decode_rx.try_recv() {
+            self.decoding_assets.remove(&asset_id);
+            match res {
+                Ok(samples) => {
+                    if let Some(asset) = self.state.assets.iter_mut().find(|a| a.id == asset_id) {
+                        asset.audio_samples = Some(std::sync::Arc::new(samples));
+                        // If it's an audio-only file, compute the duration
+                        if !asset.is_video && asset.audio_channels > 0 && asset.audio_sample_rate > 0 {
+                            asset.duration_secs = asset.audio_samples.as_ref().unwrap().len() as f64
+                                / (asset.audio_channels as f64 * asset.audio_sample_rate as f64);
+                        }
+                    }
+                }
+                Err(e) => {
+                    self.export_status = format!("Audio decoding failed: {}", e);
+                }
+            }
         }
 
         // 1. Check for background export thread updates
@@ -123,12 +153,24 @@ impl eframe::App for SiloCutApp {
                 for file in &i.raw.dropped_files {
                     if let Some(path) = &file.path {
                         let next_id = self.state.assets.len();
-                        match media::MediaAsset::load(next_id, path) {
+                        match media::MediaAsset::load_metadata(next_id, path) {
                             Ok(asset) => {
+                                let asset_id = asset.id;
+                                let has_audio = asset.audio_channels > 0 && asset.audio_sample_rate > 0;
                                 self.state.assets.push(asset);
+                                
+                                if has_audio {
+                                    self.decoding_assets.insert(asset_id);
+                                    let path_clone = path.clone();
+                                    let tx_clone = self.audio_decode_tx.clone();
+                                    std::thread::spawn(move || {
+                                        let res = media::MediaAsset::decode_audio_samples(&path_clone);
+                                        let _ = tx_clone.send((asset_id, res));
+                                    });
+                                }
                             }
                             Err(e) => {
-                                eprintln!("Failed to load asset: {}", e);
+                                eprintln!("Failed to load asset metadata: {}", e);
                             }
                         }
                     }
@@ -191,12 +233,24 @@ impl eframe::App for SiloCutApp {
                             .pick_file()
                         {
                             let next_id = self.state.assets.len();
-                            match media::MediaAsset::load(next_id, &path) {
+                            match media::MediaAsset::load_metadata(next_id, &path) {
                                 Ok(asset) => {
+                                    let asset_id = asset.id;
+                                    let has_audio = asset.audio_channels > 0 && asset.audio_sample_rate > 0;
                                     self.state.assets.push(asset);
+                                    
+                                    if has_audio {
+                                        self.decoding_assets.insert(asset_id);
+                                        let path_clone = path.clone();
+                                        let tx_clone = self.audio_decode_tx.clone();
+                                        std::thread::spawn(move || {
+                                            let res = media::MediaAsset::decode_audio_samples(&path_clone);
+                                            let _ = tx_clone.send((asset_id, res));
+                                        });
+                                    }
                                 }
                                 Err(e) => {
-                                    eprintln!("Failed to load asset: {}", e);
+                                    eprintln!("Failed to load asset metadata: {}", e);
                                 }
                             }
                         }
@@ -282,7 +336,7 @@ impl eframe::App for SiloCutApp {
                                 match self.recorder.stop() {
                                     Ok(path) => {
                                         let next_id = self.state.assets.len();
-                                        match media::MediaAsset::load(next_id, &path) {
+                                        match media::MediaAsset::load_metadata(next_id, &path) {
                                             Ok(asset) => {
                                                 self.state.assets.push(asset);
                                                 self.export_status = "Recording saved and imported!".to_string();
@@ -326,13 +380,19 @@ impl eframe::App for SiloCutApp {
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         for asset in &self.state.assets {
                             let type_str = if asset.is_video { "▶ Video" } else { "♫ Audio" };
-                            let label = format!("{} - {}", type_str, asset.name);
+                            let is_decoding = self.decoding_assets.contains(&asset.id);
+                            let label = if is_decoding {
+                                format!("{} - {} (Decoding Audio...)", type_str, asset.name)
+                            } else {
+                                format!("{} - {}", type_str, asset.name)
+                            };
                             
                             let response = ui.selectable_label(false, label);
                             
                             // Context menu to add to timeline
                             response.context_menu(|ui| {
-                                if ui.button("Add to Timeline").clicked() {
+                                let btn = egui::Button::new("Add to Timeline");
+                                if ui.add_enabled(!is_decoding, btn).clicked() {
                                     let timeline_start = self.state.playhead_secs;
                                     let timeline_end = timeline_start + asset.duration_secs;
                                     

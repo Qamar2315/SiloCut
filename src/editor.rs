@@ -82,12 +82,14 @@ impl EditorState {
         let mut first_clip = clip.clone();
         first_clip.timeline_end = time_secs;
         first_clip.source_trim_end = clip.source_trim_start + split_offset;
+        first_clip.fade_out_duration = 0.0; // Clear fade-out at split point
 
         let mut second_clip = clip.clone();
         second_clip.id = self.next_clip_id;
         self.next_clip_id += 1;
         second_clip.timeline_start = time_secs;
         second_clip.source_trim_start = clip.source_trim_start + split_offset;
+        second_clip.fade_in_duration = 0.0; // Clear fade-in at split point
 
         track.clips[clip_idx] = first_clip;
         track.clips.insert(clip_idx + 1, second_clip);

@@ -224,11 +224,12 @@ fn mix_track_audio(
                             
                             // Apply volume slider and fades
                             let mut volume_factor = track.volume;
-                            if clip.fade_in_duration > 0.0 && clip_offset < clip.fade_in_duration {
-                                volume_factor *= (clip_offset / clip.fade_in_duration) as f32;
-                            } else if clip.fade_out_duration > 0.0 && (clip.timeline_end - t) < clip.fade_out_duration {
-                                volume_factor *= ((clip.timeline_end - t) / clip.fade_out_duration) as f32;
-                            }
+                             if clip.fade_in_duration > 0.0 && clip_offset < clip.fade_in_duration {
+                                 volume_factor *= (clip_offset / clip.fade_in_duration) as f32;
+                             }
+                             if clip.fade_out_duration > 0.0 && (clip.timeline_end - t) < clip.fade_out_duration {
+                                 volume_factor *= ((clip.timeline_end - t) / clip.fade_out_duration) as f32;
+                             }
                             
                             mixed_audio[idx * 2] += left_val * volume_factor;
                             mixed_audio[idx * 2 + 1] += right_val * volume_factor;
@@ -298,6 +299,7 @@ pub fn export_timeline(state: &EditorState, path: &Path, width: u32, height: u32
 
     // Set up H.264 Encoder
     let mut encoder = Encoder::new().map_err(|e| e.to_string())?;
+    let mut bitstream_buffer = Vec::new();
 
     // Cache of open asset decoders
     let mut decoders: HashMap<usize, AssetExportDecoder> = HashMap::new();
@@ -361,12 +363,13 @@ pub fn export_timeline(state: &EditorState, path: &Path, width: u32, height: u32
 
                     // Apply video opacity fades
                     let mut alpha = 1.0f32;
-                    if clip.fade_in_duration > 0.0 && (time_secs - clip.timeline_start) < clip.fade_in_duration {
-                        alpha = ((time_secs - clip.timeline_start) / clip.fade_in_duration) as f32;
-                    } else if clip.fade_out_duration > 0.0 && (clip.timeline_end - time_secs) < clip.fade_out_duration {
-                        alpha = ((clip.timeline_end - time_secs) / clip.fade_out_duration) as f32;
-                    }
-                    alpha = alpha.clamp(0.0, 1.0);
+                     if clip.fade_in_duration > 0.0 && (time_secs - clip.timeline_start) < clip.fade_in_duration {
+                         alpha *= ((time_secs - clip.timeline_start) / clip.fade_in_duration) as f32;
+                     }
+                     if clip.fade_out_duration > 0.0 && (clip.timeline_end - time_secs) < clip.fade_out_duration {
+                         alpha *= ((clip.timeline_end - time_secs) / clip.fade_out_duration) as f32;
+                     }
+                     alpha = alpha.clamp(0.0, 1.0);
 
                     if alpha < 1.0 {
                         for val in &mut rgb_export_data {
@@ -380,11 +383,13 @@ pub fn export_timeline(state: &EditorState, path: &Path, width: u32, height: u32
                     );
 
                     // Encode frame
-                    if let Ok(bitstream) = encoder.encode(&yuv_buffer) {
-                        muxer.encode_video(&bitstream.to_vec(), frame_duration_ms)
-                            .map_err(|e| e.to_string())?;
-                        output_frame_written = true;
-                    }
+                     if let Ok(bitstream) = encoder.encode(&yuv_buffer) {
+                         bitstream_buffer.clear();
+                         bitstream.write_vec(&mut bitstream_buffer);
+                         muxer.encode_video(&bitstream_buffer, frame_duration_ms)
+                             .map_err(|e| e.to_string())?;
+                         output_frame_written = true;
+                     }
                 }
             }
         }
@@ -395,10 +400,12 @@ pub fn export_timeline(state: &EditorState, path: &Path, width: u32, height: u32
             let yuv_buffer = YUVBuffer::from_rgb_source(
                 openh264::formats::RgbSliceU8::new(&black_rgb, (width as usize, height as usize))
             );
-            if let Ok(bitstream) = encoder.encode(&yuv_buffer) {
-                muxer.encode_video(&bitstream.to_vec(), frame_duration_ms)
-                    .map_err(|e| e.to_string())?;
-            }
+              if let Ok(bitstream) = encoder.encode(&yuv_buffer) {
+                  bitstream_buffer.clear();
+                  bitstream.write_vec(&mut bitstream_buffer);
+                  muxer.encode_video(&bitstream_buffer, frame_duration_ms)
+                      .map_err(|e| e.to_string())?;
+              }
         }
     }
 
