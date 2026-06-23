@@ -20,6 +20,14 @@ struct SiloCutApp {
     export_height: u32,
     export_fps: u32,
     export_path: Option<PathBuf>,
+    
+    // Undo/Redo history stacks
+    undo_stack: Vec<EditorState>,
+    redo_stack: Vec<EditorState>,
+    skip_undo_save: bool,
+
+    // Channel receiver for background export thread
+    export_rx: Option<std::sync::mpsc::Receiver<Result<PathBuf, String>>>,
 }
 
 impl SiloCutApp {
@@ -40,13 +48,65 @@ impl SiloCutApp {
             export_height: 1080,
             export_fps: 30,
             export_path: None,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            skip_undo_save: false,
+            export_rx: None,
+        }
+    }
+
+    fn save_state_to_undo(&mut self) {
+        if self.undo_stack.len() >= 50 {
+            self.undo_stack.remove(0);
+        }
+        self.undo_stack.push(self.state.clone());
+        self.redo_stack.clear();
+    }
+
+    fn undo(&mut self) {
+        if let Some(prev_state) = self.undo_stack.pop() {
+            self.redo_stack.push(self.state.clone());
+            self.state = prev_state;
+            let playhead = self.state.playhead_secs;
+            self.preview.seek_to(&mut self.state, playhead);
+            self.skip_undo_save = true;
+        }
+    }
+
+    fn redo(&mut self) {
+        if let Some(next_state) = self.redo_stack.pop() {
+            self.undo_stack.push(self.state.clone());
+            self.state = next_state;
+            let playhead = self.state.playhead_secs;
+            self.preview.seek_to(&mut self.state, playhead);
+            self.skip_undo_save = true;
         }
     }
 }
 
 impl eframe::App for SiloCutApp {
-    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx();
+
+        // 1. Check for background export thread updates
+        if let Some(ref rx) = self.export_rx {
+            if let Ok(res) = rx.try_recv() {
+                self.export_in_progress = false;
+                match res {
+                    Ok(p) => {
+                        self.export_status = format!("Exported: {}", p.file_name().unwrap().to_string_lossy());
+                    }
+                    Err(e) => {
+                        self.export_status = format!("Failed: {}", e);
+                    }
+                }
+                self.export_rx = None;
+            }
+        }
+
+        // Save state snapshot before UI layout/interaction to detect timeline changes
+        let last_frame_state = self.state.clone();
+
         // Handle background updates for previews
         self.preview.update(&mut self.state, ctx);
 
@@ -68,6 +128,51 @@ impl eframe::App for SiloCutApp {
                 }
             }
         });
+
+        // Capture keyboard hotkeys
+        if !ctx.wants_keyboard_input() {
+            // Space: Toggle Play/Pause
+            if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
+                if self.state.is_playing {
+                    self.preview.stop_playback(&mut self.state);
+                } else {
+                    self.preview.start_playback(&mut self.state);
+                }
+            }
+
+            // Left Arrow: Step back 1 frame (1/30th sec)
+            if ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
+                let new_time = (self.state.playhead_secs - 1.0 / 30.0).max(0.0);
+                self.preview.seek_to(&mut self.state, new_time);
+            }
+
+            // Right Arrow: Step forward 1 frame (1/30th sec)
+            if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
+                let new_time = self.state.playhead_secs + 1.0 / 30.0;
+                self.preview.seek_to(&mut self.state, new_time);
+            }
+
+            // Delete or Backspace: Remove selected clip
+            if ctx.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)) {
+                if let Some((is_video, track_idx, clip_idx)) = self.state.selected_clip {
+                    let tracks = if is_video { &mut self.state.video_tracks } else { &mut self.state.audio_tracks };
+                    if track_idx < tracks.len() && clip_idx < tracks[track_idx].clips.len() {
+                        tracks[track_idx].clips.remove(clip_idx);
+                        self.state.selected_clip = None;
+                    }
+                }
+            }
+
+            // Ctrl+Z: Undo
+            if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Z)) {
+                self.undo();
+            }
+
+            // Ctrl+Y: Redo
+            if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Y)) {
+                self.redo();
+            }
+        }
 
         // Top Menu Bar
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
@@ -97,24 +202,40 @@ impl eframe::App for SiloCutApp {
                 });
 
                 ui.menu_button("Edit", |ui| {
+                    if ui.add_enabled(!self.undo_stack.is_empty(), egui::Button::new("Undo (Ctrl+Z)")).clicked() {
+                        self.undo();
+                        ui.close_menu();
+                    }
+                    if ui.add_enabled(!self.redo_stack.is_empty(), egui::Button::new("Redo (Ctrl+Y)")).clicked() {
+                        self.redo();
+                        ui.close_menu();
+                    }
+                    ui.separator();
                     if ui.button("Split Clip (Razor)").clicked() {
-                        // Triggers razor split on active clip
                         let playhead = self.state.playhead_secs;
                         if let Some((is_video, track_idx, clip_idx)) = self.state.selected_clip {
                             self.state.razor_at(is_video, track_idx, clip_idx, playhead);
                         }
+                        ui.close_menu();
                     }
                 });
 
                 ui.menu_button("Export", |ui| {
-                    if ui.button("Export Video...").clicked() {
+                    if ui.button("Export Video & Audio...").clicked() {
                         self.show_export_dialog = true;
                         ui.close_menu();
                     }
                 });
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label("SiloCut v1.0");
+                    if self.export_in_progress {
+                        ui.spinner();
+                        ui.label("Rendering output...");
+                    } else if !self.export_status.is_empty() {
+                        ui.label(&self.export_status);
+                    } else {
+                        ui.label("SiloCut v1.0");
+                    }
                 });
             });
         });
@@ -152,8 +273,6 @@ impl eframe::App for SiloCutApp {
                             // Context menu to add to timeline
                             response.context_menu(|ui| {
                                 if ui.button("Add to Timeline").clicked() {
-                                    // Add to track 1 or 2 based on type
-                                    let track_idx = 0;
                                     let timeline_start = self.state.playhead_secs;
                                     let timeline_end = timeline_start + asset.duration_secs;
                                     
@@ -164,17 +283,41 @@ impl eframe::App for SiloCutApp {
                                         timeline_end,
                                         source_trim_start: 0.0,
                                         source_trim_end: asset.duration_secs,
+                                        fade_in_duration: 0.0,
+                                        fade_out_duration: 0.0,
                                     };
                                     self.state.next_clip_id += 1;
                                     
                                     if asset.is_video {
-                                        if let Some(track) = self.state.video_tracks.get_mut(track_idx) {
-                                            track.clips.push(clip);
+                                        if self.state.video_tracks.is_empty() {
+                                            self.state.video_tracks.push(editor::Track {
+                                                id: self.state.next_track_id,
+                                                name: "Video 1".to_string(),
+                                                is_video: true,
+                                                is_muted: false,
+                                                is_hidden: false,
+                                                is_solo: false,
+                                                volume: 1.0,
+                                                clips: Vec::new(),
+                                            });
+                                            self.state.next_track_id += 1;
                                         }
+                                        self.state.video_tracks[0].clips.push(clip);
                                     } else {
-                                        if let Some(track) = self.state.audio_tracks.get_mut(track_idx) {
-                                            track.clips.push(clip);
+                                        if self.state.audio_tracks.is_empty() {
+                                            self.state.audio_tracks.push(editor::Track {
+                                                id: self.state.next_track_id,
+                                                name: "Audio 1".to_string(),
+                                                is_video: false,
+                                                is_muted: false,
+                                                is_hidden: false,
+                                                is_solo: false,
+                                                volume: 1.0,
+                                                clips: Vec::new(),
+                                            });
+                                            self.state.next_track_id += 1;
                                         }
+                                        self.state.audio_tracks[0].clips.push(clip);
                                     }
                                     ui.close_menu();
                                 }
@@ -321,18 +464,31 @@ impl eframe::App for SiloCutApp {
                             let height = self.export_height;
                             let fps = self.export_fps;
 
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            self.export_rx = Some(rx);
+
                             // Run export in background thread
                             std::thread::spawn(move || {
-                                match export::export_timeline(&state_clone, &path_clone, width, height, fps) {
-                                    Ok(_) => println!("Export Succeeded"),
-                                    Err(e) => eprintln!("Export Failed: {}", e),
-                                }
+                                let res = export::export_timeline(&state_clone, &path_clone, width, height, fps);
+                                let _ = tx.send(res.map(|_| path_clone));
                             });
                             self.show_export_dialog = false;
                         }
                     });
                 });
         }
+
+        // Compare states to see if we need to push to undo stack
+        let state_modified = self.state.video_tracks != last_frame_state.video_tracks
+            || self.state.audio_tracks != last_frame_state.audio_tracks
+            || self.state.assets.len() != last_frame_state.assets.len()
+            || self.state.next_clip_id != last_frame_state.next_clip_id
+            || self.state.next_track_id != last_frame_state.next_track_id;
+
+        if state_modified && !self.skip_undo_save {
+            self.save_state_to_undo();
+        }
+        self.skip_undo_save = false; // Reset for the next frame
     }
 }
 
@@ -350,4 +506,3 @@ fn main() -> eframe::Result {
         Box::new(|cc| Ok(Box::new(SiloCutApp::new(cc)))),
     )
 }
-

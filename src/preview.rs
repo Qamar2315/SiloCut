@@ -1,5 +1,5 @@
 use crate::editor::EditorState;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::mpsc::{Sender, Receiver, channel};
 use symphonia::core::formats::{FormatReader, FormatOptions, SeekMode, SeekTo};
 use symphonia::core::io::MediaSourceStream;
@@ -49,7 +49,7 @@ pub struct PreviewEngine {
 // Fast integer BT.601 limited-range YUV420p to RGBA conversion
 fn yuv420p_to_rgba(
     width: usize,
-    height: usize,
+    _height: usize,
     y_plane: &[u8],
     u_plane: &[u8],
     v_plane: &[u8],
@@ -267,8 +267,10 @@ impl PreviewEngine {
     
     // Finds active video clip and mapped source timestamp at current playhead
     fn get_active_video_clip_and_time<'a>(&self, state: &'a EditorState, time_secs: f64) -> Option<(&'a crate::editor::Clip, &'a crate::media::MediaAsset, f64)> {
+        let has_solo_video = state.video_tracks.iter().any(|t| t.is_solo);
         for track in state.video_tracks.iter().rev() {
-            if track.is_hidden || track.is_muted {
+            let is_active = !track.is_hidden && (!has_solo_video || track.is_solo);
+            if !is_active {
                 continue;
             }
             for clip in &track.clips {
@@ -312,7 +314,7 @@ impl PreviewEngine {
         }
 
         // 3. Request video frame decode/fetch
-        if let Some((_clip, asset, source_time)) = self.get_active_video_clip_and_time(state, state.playhead_secs) {
+        if let Some((clip, asset, source_time)) = self.get_active_video_clip_and_time(state, state.playhead_secs) {
             let frame_idx = (source_time * asset.fps).round() as usize;
             let frame_key = (asset.id, frame_idx);
 
@@ -320,9 +322,27 @@ impl PreviewEngine {
                 // Instantly upload texture if frame is cached and not currently displayed
                 if self.current_frame_key != Some(frame_key) {
                     if let Some(cached) = self.frame_cache.get(&frame_key) {
+                        let playhead = state.playhead_secs;
+                        let mut alpha = 1.0f32;
+                        if clip.fade_in_duration > 0.0 && (playhead - clip.timeline_start) < clip.fade_in_duration {
+                            alpha = ((playhead - clip.timeline_start) / clip.fade_in_duration) as f32;
+                        } else if clip.fade_out_duration > 0.0 && (clip.timeline_end - playhead) < clip.fade_out_duration {
+                            alpha = ((clip.timeline_end - playhead) / clip.fade_out_duration) as f32;
+                        }
+                        alpha = alpha.clamp(0.0, 1.0);
+
+                        let mut rgba = cached.rgba.clone();
+                        if alpha < 1.0 {
+                            rgba.par_chunks_exact_mut(4).for_each(|pixel| {
+                                pixel[0] = (pixel[0] as f32 * alpha) as u8;
+                                pixel[1] = (pixel[1] as f32 * alpha) as u8;
+                                pixel[2] = (pixel[2] as f32 * alpha) as u8;
+                            });
+                        }
+
                         let color_image = egui::ColorImage::from_rgba_unmultiplied(
                             [cached.width, cached.height],
-                            &cached.rgba
+                            &rgba
                         );
                         self.current_texture = Some(ctx.load_texture(
                             "video_preview",
@@ -358,13 +378,31 @@ impl PreviewEngine {
             });
 
             // Update displayed texture if response matches currently desired frame
-            if let Some((_clip, asset, source_time)) = self.get_active_video_clip_and_time(state, state.playhead_secs) {
+            if let Some((clip, asset, source_time)) = self.get_active_video_clip_and_time(state, state.playhead_secs) {
                 let current_idx = (source_time * asset.fps).round() as usize;
                 if (asset.id, current_idx) == frame_key {
                     if let Some(cached) = self.frame_cache.get(&frame_key) {
+                        let playhead = state.playhead_secs;
+                        let mut alpha = 1.0f32;
+                        if clip.fade_in_duration > 0.0 && (playhead - clip.timeline_start) < clip.fade_in_duration {
+                            alpha = ((playhead - clip.timeline_start) / clip.fade_in_duration) as f32;
+                        } else if clip.fade_out_duration > 0.0 && (clip.timeline_end - playhead) < clip.fade_out_duration {
+                            alpha = ((clip.timeline_end - playhead) / clip.fade_out_duration) as f32;
+                        }
+                        alpha = alpha.clamp(0.0, 1.0);
+
+                        let mut rgba = cached.rgba.clone();
+                        if alpha < 1.0 {
+                            rgba.par_chunks_exact_mut(4).for_each(|pixel| {
+                                pixel[0] = (pixel[0] as f32 * alpha) as u8;
+                                pixel[1] = (pixel[1] as f32 * alpha) as u8;
+                                pixel[2] = (pixel[2] as f32 * alpha) as u8;
+                            });
+                        }
+
                         let color_image = egui::ColorImage::from_rgba_unmultiplied(
                             [cached.width, cached.height],
-                            &cached.rgba
+                            &rgba
                         );
                         self.current_texture = Some(ctx.load_texture(
                             "video_preview",
@@ -397,13 +435,13 @@ impl PreviewEngine {
                     let num_samples = (0.1 * sample_rate as f64) as usize * channels;
                     let mut mixed_samples = vec![0.0f32; num_samples];
 
-                    // Gather and mix audio from video and audio tracks
-                    let mut tracks_to_mix = Vec::new();
-                    tracks_to_mix.extend(state.video_tracks.iter());
-                    tracks_to_mix.extend(state.audio_tracks.iter());
+                    let has_solo_video = state.video_tracks.iter().any(|t| t.is_solo);
+                    let has_solo_audio = state.audio_tracks.iter().any(|t| t.is_solo);
 
-                    for track in tracks_to_mix {
-                        if track.is_muted {
+                    // Mix video tracks
+                    for track in &state.video_tracks {
+                        let is_active = !track.is_hidden && (!has_solo_video || track.is_solo);
+                        if !is_active {
                             continue;
                         }
                         for clip in &track.clips {
@@ -441,8 +479,75 @@ impl PreviewEngine {
                                                             }
                                                         }
 
-                                                        mixed_samples[i * 2] += left_val;
-                                                        mixed_samples[i * 2 + 1] += right_val;
+                                                        let mut volume_factor = track.volume;
+                                                        if clip.fade_in_duration > 0.0 && clip_offset < clip.fade_in_duration {
+                                                            volume_factor *= (clip_offset / clip.fade_in_duration) as f32;
+                                                        } else if clip.fade_out_duration > 0.0 && (clip.timeline_end - t) < clip.fade_out_duration {
+                                                            volume_factor *= ((clip.timeline_end - t) / clip.fade_out_duration) as f32;
+                                                        }
+
+                                                        mixed_samples[i * 2] += left_val * volume_factor;
+                                                        mixed_samples[i * 2 + 1] += right_val * volume_factor;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Mix audio tracks
+                    for track in &state.audio_tracks {
+                        let is_active = !track.is_muted && (!has_solo_audio || track.is_solo);
+                        if !is_active {
+                            continue;
+                        }
+                        for clip in &track.clips {
+                            let overlap_start = start_t.max(clip.timeline_start);
+                            let overlap_end = end_t.min(clip.timeline_end);
+
+                            if overlap_start < overlap_end {
+                                if let Some(asset) = state.assets.iter().find(|a| a.id == clip.asset_id) {
+                                    if let Some(ref samples) = asset.audio_samples {
+                                        let num_frames = 4410; // 0.1 * 44100
+                                        for i in 0..num_frames {
+                                            let t = start_t + (i as f64 / 44100.0);
+                                            if t >= clip.timeline_start && t < clip.timeline_end {
+                                                let clip_offset = t - clip.timeline_start;
+                                                let src_t = clip.source_trim_start + clip_offset;
+
+                                                if src_t >= 0.0 && src_t < asset.duration_secs {
+                                                    let src_sample_idx = (src_t * asset.audio_sample_rate as f64) as usize;
+                                                    let asset_channels = asset.audio_channels as usize;
+                                                    
+                                                    if asset_channels > 0 {
+                                                        let mut left_val = 0.0f32;
+                                                        let mut right_val = 0.0f32;
+
+                                                        if asset_channels == 1 {
+                                                            if src_sample_idx < samples.len() {
+                                                                left_val = samples[src_sample_idx];
+                                                                right_val = samples[src_sample_idx];
+                                                            }
+                                                        } else {
+                                                            let base_idx = src_sample_idx * asset_channels;
+                                                            if base_idx + 1 < samples.len() {
+                                                                left_val = samples[base_idx];
+                                                                right_val = samples[base_idx + 1];
+                                                            }
+                                                        }
+
+                                                        let mut volume_factor = track.volume;
+                                                        if clip.fade_in_duration > 0.0 && clip_offset < clip.fade_in_duration {
+                                                            volume_factor *= (clip_offset / clip.fade_in_duration) as f32;
+                                                        } else if clip.fade_out_duration > 0.0 && (clip.timeline_end - t) < clip.fade_out_duration {
+                                                            volume_factor *= ((clip.timeline_end - t) / clip.fade_out_duration) as f32;
+                                                        }
+
+                                                        mixed_samples[i * 2] += left_val * volume_factor;
+                                                        mixed_samples[i * 2 + 1] += right_val * volume_factor;
                                                     }
                                                 }
                                             }
