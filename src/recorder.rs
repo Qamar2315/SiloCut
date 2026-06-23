@@ -14,7 +14,56 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN,
     GetCursorInfo, GetIconInfo, DrawIconEx, CURSORINFO, ICONINFO, CURSOR_SHOWING, DI_NORMAL,
 };
-use windows_sys::Win32::Foundation::HWND;
+use windows_sys::Win32::Graphics::Gdi::{
+    EnumDisplayMonitors, GetMonitorInfoW, MONITORINFO, HMONITOR,
+};
+
+// MONITORINFOF_PRIMARY is not re-exported by windows-sys 0.52; its value is 1.
+const MONITORINFOF_PRIMARY: u32 = 1;
+use windows_sys::Win32::Foundation::{HWND, RECT, LPARAM, BOOL};
+
+/// Information about a connected display, used by the recorder's monitor picker.
+#[derive(Clone)]
+pub struct MonitorInfo {
+    pub label: String,
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+/// Enumerate connected monitors in virtual-screen coordinates.
+pub fn list_monitors() -> Vec<MonitorInfo> {
+    unsafe extern "system" fn enum_cb(hmon: HMONITOR, _hdc: HDC, _rc: *mut RECT, data: LPARAM) -> BOOL {
+        let monitors = &mut *(data as *mut Vec<MonitorInfo>);
+        let mut mi: MONITORINFO = std::mem::zeroed();
+        mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(hmon, &mut mi) != 0 {
+            let r = mi.rcMonitor;
+            let is_primary = (mi.dwFlags & MONITORINFOF_PRIMARY) != 0;
+            let idx = monitors.len() + 1;
+            monitors.push(MonitorInfo {
+                label: format!("Monitor {}{}", idx, if is_primary { " (primary)" } else { "" }),
+                x: r.left,
+                y: r.top,
+                width: r.right - r.left,
+                height: r.bottom - r.top,
+            });
+        }
+        1 // continue enumeration
+    }
+
+    let mut monitors: Vec<MonitorInfo> = Vec::new();
+    unsafe {
+        EnumDisplayMonitors(
+            0,
+            std::ptr::null(),
+            Some(enum_cb),
+            &mut monitors as *mut Vec<MonitorInfo> as LPARAM,
+        );
+    }
+    monitors
+}
 
 /// Composites the current mouse cursor onto `hdc` at its on-screen position so the
 /// recording includes the pointer. Best-effort: does nothing if the cursor is

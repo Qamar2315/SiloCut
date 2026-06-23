@@ -17,8 +17,10 @@ struct SiloCutApp {
     preview: PreviewEngine,
     recorder: recorder::ScreenRecorder,
     record_fps: u32,
+    record_monitor: usize,
     record_countdown: Option<std::time::Instant>,
     pending_record_path: Option<PathBuf>,
+    pending_record_region: Option<(i32, i32, i32, i32)>,
     recording_started: Option<std::time::Instant>,
     export_in_progress: bool,
     export_status: String,
@@ -66,8 +68,10 @@ impl SiloCutApp {
             preview: PreviewEngine::new(),
             recorder: recorder::ScreenRecorder::new(),
             record_fps: 30,
+            record_monitor: 0,
             record_countdown: None,
             pending_record_path: None,
+            pending_record_region: None,
             recording_started: None,
             export_in_progress: false,
             export_status: String::new(),
@@ -572,7 +576,7 @@ impl eframe::App for SiloCutApp {
                         if remaining <= 0.0 {
                             self.record_countdown = None;
                             if let Some(path) = self.pending_record_path.take() {
-                                match self.recorder.start(path, self.record_fps, None) {
+                                match self.recorder.start(path, self.record_fps, self.pending_record_region.take()) {
                                     Ok(()) => {
                                         self.recording_started = Some(std::time::Instant::now());
                                         self.export_status = "Recording started...".to_string();
@@ -594,17 +598,35 @@ impl eframe::App for SiloCutApp {
                             }
                         }
                     } else {
+                        let monitors = recorder::list_monitors();
                         ui.horizontal(|ui| {
                             ui.label("FPS:");
                             ui.radio_value(&mut self.record_fps, 30, "30");
                             ui.radio_value(&mut self.record_fps, 60, "60");
                         });
+                        if monitors.len() > 1 {
+                            if self.record_monitor >= monitors.len() {
+                                self.record_monitor = 0;
+                            }
+                            egui::ComboBox::from_label("Screen")
+                                .selected_text(
+                                    monitors.get(self.record_monitor).map(|m| m.label.clone()).unwrap_or_default(),
+                                )
+                                .show_ui(ui, |ui| {
+                                    for (i, m) in monitors.iter().enumerate() {
+                                        ui.selectable_value(&mut self.record_monitor, i, m.label.as_str());
+                                    }
+                                });
+                        }
                         if ui.button("● Start Recording").clicked() {
                             if let Some(path) = rfd::FileDialog::new()
                                 .add_filter("MP4 Video", &["mp4"])
                                 .set_file_name("recording.mp4")
                                 .save_file()
                             {
+                                self.pending_record_region = monitors
+                                    .get(self.record_monitor)
+                                    .map(|m| (m.x, m.y, m.width, m.height));
                                 self.pending_record_path = Some(path);
                                 self.record_countdown = Some(std::time::Instant::now());
                             }
