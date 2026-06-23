@@ -16,6 +16,10 @@ pub struct MediaAsset {
     pub height: u32,
     pub fps: f64,
     pub is_video: bool,
+    // A still image (PNG/JPEG) used as a visual clip. `#[serde(default)]` keeps
+    // older project files (without this field) loadable.
+    #[serde(default)]
+    pub is_image: bool,
     // Decoded PCM samples are re-derived from `path` on load, never serialized.
     #[serde(skip)]
     pub audio_samples: Option<Arc<Vec<f32>>>,
@@ -25,6 +29,16 @@ pub struct MediaAsset {
 
 impl MediaAsset {
     pub fn load_metadata(id: usize, path: &Path) -> Result<Self, String> {
+        // Still images are handled directly; symphonia can't probe them.
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_lowercase())
+            .unwrap_or_default();
+        if matches!(ext.as_str(), "png" | "jpg" | "jpeg") {
+            return Self::load_image_metadata(id, path);
+        }
+
         let file = std::fs::File::open(path)
             .map_err(|e| format!("Failed to open file: {}", e))?;
         
@@ -134,9 +148,36 @@ impl MediaAsset {
             height,
             fps,
             is_video,
+            is_image: false,
             audio_samples: None,
             audio_channels,
             audio_sample_rate,
+        })
+    }
+
+    /// Build a still-image asset (PNG/JPEG). Images get a default 5s clip length
+    /// that the user can trim or extend on the timeline.
+    fn load_image_metadata(id: usize, path: &Path) -> Result<Self, String> {
+        let (w, h) = image::image_dimensions(path)
+            .map_err(|e| format!("Failed to read image: {}", e))?;
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        Ok(Self {
+            id,
+            path: path.to_path_buf(),
+            name,
+            duration_secs: 5.0,
+            width: w,
+            height: h,
+            fps: 30.0,
+            is_video: false,
+            is_image: true,
+            audio_samples: None,
+            audio_channels: 0,
+            audio_sample_rate: 0,
         })
     }
 
@@ -197,7 +238,27 @@ impl MediaAsset {
         if samples_vec.is_empty() {
             return Err("No audio samples decoded".to_string());
         }
-        
+
         Ok(samples_vec)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loads_still_image_metadata() {
+        let tmp = std::env::temp_dir().join(format!("silocut_img_test_{}.png", std::process::id()));
+        image::RgbImage::from_pixel(64, 48, image::Rgb([10, 20, 30])).save(&tmp).unwrap();
+
+        let asset = MediaAsset::load_metadata(0, &tmp).expect("load image metadata");
+        let _ = std::fs::remove_file(&tmp);
+
+        assert!(asset.is_image, "should be flagged as an image");
+        assert!(!asset.is_video, "should not be a video");
+        assert_eq!((asset.width, asset.height), (64, 48));
+        assert!(asset.duration_secs > 0.0, "image needs a default duration");
+        assert_eq!(asset.audio_channels, 0);
     }
 }

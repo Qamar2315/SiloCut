@@ -402,9 +402,18 @@ pub fn show_timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                         ));
                     }
 
+                    // Audio waveform for audio-track clips that have decoded samples.
+                    let asset = state.assets.iter().find(|a| a.id == clip.asset_id);
+                    if !is_video {
+                        if let Some(asset) = asset {
+                            if let Some(ref samples) = asset.audio_samples {
+                                draw_waveform(&clip_painter, clip_rect, clip, asset, samples);
+                            }
+                        }
+                    }
+
                     // Label details
-                    let asset_name = state.assets.iter()
-                        .find(|a| a.id == clip.asset_id)
+                    let asset_name = asset
                         .map(|a| a.name.clone())
                         .unwrap_or_else(|| format!("Clip {}", clip.id));
                     let label_text = format!("{} [{:.1}s - {:.1}s]", asset_name, clip.source_trim_start, clip.source_trim_end);
@@ -720,7 +729,9 @@ pub fn show_timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                 let clip = &tracks[track_idx].clips[clip_idx];
                                 state.assets.iter()
                                     .find(|a| a.id == clip.asset_id)
-                                    .map(|a| a.duration_secs)
+                                    // Still images have no real source length, so allow
+                                    // extending them freely on the timeline.
+                                    .map(|a| if a.is_image { 86_400.0 } else { a.duration_secs })
                                     .unwrap_or(3600.0)
                             };
 
@@ -774,6 +785,40 @@ pub fn show_timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     if let Some(idx) = audio_track_to_delete {
         state.audio_tracks.remove(idx);
         state.selected_clip = None;
+    }
+}
+
+// Draw a translucent amplitude waveform of `samples` across the clip's body,
+// mapped over the clip's source trim range.
+fn draw_waveform(
+    painter: &egui::Painter,
+    rect: Rect,
+    clip: &Clip,
+    asset: &crate::media::MediaAsset,
+    samples: &[f32],
+) {
+    let channels = asset.audio_channels.max(1) as usize;
+    let sr = asset.audio_sample_rate.max(1) as f64;
+    let mid_y = rect.center().y;
+    let half_h = (rect.height() * 0.5 - 3.0).max(1.0);
+    let span = (clip.source_trim_end - clip.source_trim_start).max(1e-6);
+    let w = rect.width().max(1.0);
+    let color = Color32::from_rgba_unmultiplied(230, 255, 240, 70);
+
+    let mut x = rect.left();
+    while x < rect.right() {
+        let f = ((x - rect.left()) / w).clamp(0.0, 1.0) as f64;
+        let src_t = clip.source_trim_start + f * span;
+        let idx = (src_t * sr) as usize * channels;
+        let amp = samples.get(idx).copied().unwrap_or(0.0).abs().min(1.0);
+        let h = amp * half_h;
+        if h > 0.5 {
+            painter.line_segment(
+                [pos2(x, mid_y - h), pos2(x, mid_y + h)],
+                Stroke::new(1.0, color),
+            );
+        }
+        x += 2.0;
     }
 }
 

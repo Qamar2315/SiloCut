@@ -298,8 +298,9 @@ pub fn export_timeline(
     let mut encoder = crate::codec::build_encoder(width, height, fps, false, quality_scale)?;
     let mut bitstream_buffer = Vec::new();
 
-    // Cache of open asset decoders
+    // Cache of open asset decoders, and of decoded still images.
     let mut decoders: HashMap<usize, AssetExportDecoder> = HashMap::new();
+    let mut image_cache: HashMap<usize, image::RgbImage> = HashMap::new();
 
     let total_frames = (max_duration * fps as f64) as usize;
     let frame_duration_ms = 1000 / fps;
@@ -333,6 +334,44 @@ pub fn export_timeline(
         let mut output_frame_written = false;
 
         if let Some((clip, asset)) = active_clip_info {
+            if asset.is_image {
+                // Still image: decode once, resize to the export size, apply fades.
+                if !image_cache.contains_key(&asset.id) {
+                    if let Ok(img) = image::open(&asset.path) {
+                        image_cache.insert(asset.id, img.to_rgb8());
+                    }
+                }
+                if let Some(src) = image_cache.get(&asset.id) {
+                    let resized =
+                        image::imageops::resize(src, width, height, image::imageops::FilterType::Triangle);
+                    let mut rgb_export_data = resized.into_raw();
+
+                    let mut alpha = 1.0f32;
+                    if clip.fade_in_duration > 0.0 && (time_secs - clip.timeline_start) < clip.fade_in_duration {
+                        alpha *= ((time_secs - clip.timeline_start) / clip.fade_in_duration) as f32;
+                    }
+                    if clip.fade_out_duration > 0.0 && (clip.timeline_end - time_secs) < clip.fade_out_duration {
+                        alpha *= ((clip.timeline_end - time_secs) / clip.fade_out_duration) as f32;
+                    }
+                    alpha = alpha.clamp(0.0, 1.0);
+                    if alpha < 1.0 {
+                        for val in &mut rgb_export_data {
+                            *val = (*val as f32 * alpha) as u8;
+                        }
+                    }
+
+                    let yuv_buffer = YUVBuffer::from_rgb_source(
+                        openh264::formats::RgbSliceU8::new(&rgb_export_data, (width as usize, height as usize)),
+                    );
+                    if let Ok(bitstream) = encoder.encode(&yuv_buffer) {
+                        bitstream_buffer.clear();
+                        bitstream.write_vec(&mut bitstream_buffer);
+                        muxer.encode_video(&bitstream_buffer, frame_duration_ms)
+                            .map_err(|e| e.to_string())?;
+                        output_frame_written = true;
+                    }
+                }
+            } else {
             // Open decoder for asset if not cached
             if !decoders.contains_key(&asset.id) {
                 if let Ok(decoder) = AssetExportDecoder::new(&asset.path) {
@@ -391,6 +430,7 @@ pub fn export_timeline(
                          output_frame_written = true;
                      }
                 }
+            }
             }
         }
 

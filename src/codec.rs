@@ -235,6 +235,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_avcc_and_to_annex_b_never_panic_on_garbage() {
+        // Deterministic pseudo-random fuzz of the untrusted-input parsers.
+        let mut seed = 0x1234_5678u32;
+        let mut rng = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            seed
+        };
+        for _ in 0..4000 {
+            let len = (rng() % 96) as usize;
+            let data: Vec<u8> = (0..len).map(|_| (rng() & 0xff) as u8).collect();
+            let _ = parse_avcc(&data);
+            let _ = to_annex_b(&data, ((rng() % 4) + 1) as usize);
+        }
+    }
+
+    #[test]
     fn to_annex_b_converts_length_prefixed() {
         let nal = [0x65u8, 0x11, 0x22, 0x33];
         let mut data = (nal.len() as u32).to_be_bytes().to_vec();

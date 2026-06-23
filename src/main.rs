@@ -412,7 +412,7 @@ impl eframe::App for SiloCutApp {
                     ui.separator();
                     if ui.button("Import Media...").clicked() {
                         if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Media Files", &["mp4", "mkv", "mov", "wav", "mp3"])
+                            .add_filter("Media Files", &["mp4", "mkv", "mov", "wav", "mp3", "png", "jpg", "jpeg"])
                             .pick_file()
                         {
                             let next_id = self.state.assets.len();
@@ -562,7 +562,7 @@ impl eframe::App for SiloCutApp {
                 } else {
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         for asset in &self.state.assets {
-                            let type_str = if asset.is_video { "▶ Video" } else { "♫ Audio" };
+                            let type_str = if asset.is_video { "▶ Video" } else if asset.is_image { "🖼 Image" } else { "♫ Audio" };
                             let is_decoding = self.decoding_assets.contains(&asset.id);
                             let label = if is_decoding {
                                 format!("{} - {} (Decoding Audio...)", type_str, asset.name)
@@ -591,7 +591,7 @@ impl eframe::App for SiloCutApp {
                                     };
                                     self.state.next_clip_id += 1;
                                     
-                                    if asset.is_video {
+                                    if asset.is_video || asset.is_image {
                                         if self.state.video_tracks.is_empty() {
                                             self.state.video_tracks.push(editor::Track {
                                                 id: self.state.next_track_id,

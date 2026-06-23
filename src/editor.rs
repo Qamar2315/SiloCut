@@ -155,3 +155,62 @@ fn earliest_free_start(clips: &[Clip], desired: f64, dur: f64, exclude: usize) -
     }
     start
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn clip(id: usize, start: f64, end: f64) -> Clip {
+        Clip {
+            id,
+            asset_id: 0,
+            timeline_start: start,
+            timeline_end: end,
+            source_trim_start: 0.0,
+            source_trim_end: end - start,
+            fade_in_duration: 0.0,
+            fade_out_duration: 0.0,
+        }
+    }
+
+    #[test]
+    fn razor_splits_clip_at_time() {
+        let mut s = EditorState::new();
+        s.video_tracks[0].clips.push(clip(1, 0.0, 10.0));
+        s.next_clip_id = 2;
+        s.razor_at(true, 0, 0, 4.0);
+        let clips = &s.video_tracks[0].clips;
+        assert_eq!(clips.len(), 2);
+        assert_eq!(clips[0].timeline_end, 4.0);
+        assert_eq!(clips[1].timeline_start, 4.0);
+        assert_eq!(clips[1].timeline_end, 10.0);
+        // Source trim is continuous across the split.
+        assert!((clips[0].source_trim_end - clips[1].source_trim_start).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ripple_delete_closes_gap() {
+        let mut s = EditorState::new();
+        s.video_tracks[0].clips.push(clip(1, 0.0, 5.0));
+        s.video_tracks[0].clips.push(clip(2, 5.0, 9.0));
+        s.ripple_delete(true, 0, 0);
+        let clips = &s.video_tracks[0].clips;
+        assert_eq!(clips.len(), 1);
+        assert_eq!(clips[0].id, 2);
+        assert!((clips[0].timeline_start - 0.0).abs() < 1e-9);
+        assert!((clips[0].timeline_end - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn duplicate_places_copy_without_overlap() {
+        let mut s = EditorState::new();
+        s.video_tracks[0].clips.push(clip(1, 0.0, 5.0));
+        s.next_clip_id = 2;
+        s.duplicate_clip(true, 0, 0);
+        let clips = &s.video_tracks[0].clips;
+        assert_eq!(clips.len(), 2);
+        let copy = clips.iter().find(|c| c.id == 2).expect("copy exists");
+        assert!(copy.timeline_start >= 5.0 - 1e-9, "copy should start after original");
+        assert!((copy.timeline_end - copy.timeline_start - 5.0).abs() < 1e-9, "duration preserved");
+    }
+}
