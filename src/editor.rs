@@ -1,6 +1,6 @@
 use crate::media::MediaAsset;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Clip {
     pub id: usize,
     pub asset_id: usize,
@@ -8,15 +8,19 @@ pub struct Clip {
     pub timeline_end: f64,       // in seconds
     pub source_trim_start: f64,  // in seconds from start of source asset
     pub source_trim_end: f64,    // in seconds from start of source asset
+    pub fade_in_duration: f64,   // in seconds
+    pub fade_out_duration: f64,  // in seconds
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Track {
     pub id: usize,
     pub name: String,
     pub is_video: bool,
     pub is_muted: bool,
     pub is_hidden: bool,
+    pub is_solo: bool,
+    pub volume: f32, // 0.0 to 1.0
     pub clips: Vec<Clip>,
 }
 
@@ -38,6 +42,7 @@ pub struct EditorState {
     pub zoom_factor: f32, // pixels per second
     pub scroll_offset: f32,
     pub next_clip_id: usize,
+    pub next_track_id: usize,
 }
 
 impl EditorState {
@@ -45,12 +50,12 @@ impl EditorState {
         Self {
             assets: Vec::new(),
             video_tracks: vec![
-                Track { id: 0, name: "Video 1".to_string(), is_video: true, is_muted: false, is_hidden: false, clips: Vec::new() },
-                Track { id: 1, name: "Video 2".to_string(), is_video: true, is_muted: false, is_hidden: false, clips: Vec::new() },
+                Track { id: 0, name: "Video 1".to_string(), is_video: true, is_muted: false, is_hidden: false, is_solo: false, volume: 1.0, clips: Vec::new() },
+                Track { id: 1, name: "Video 2".to_string(), is_video: true, is_muted: false, is_hidden: false, is_solo: false, volume: 1.0, clips: Vec::new() },
             ],
             audio_tracks: vec![
-                Track { id: 2, name: "Audio 1".to_string(), is_video: false, is_muted: false, is_hidden: false, clips: Vec::new() },
-                Track { id: 3, name: "Audio 2".to_string(), is_video: false, is_muted: false, is_hidden: false, clips: Vec::new() },
+                Track { id: 2, name: "Audio 1".to_string(), is_video: false, is_muted: false, is_hidden: false, is_solo: false, volume: 1.0, clips: Vec::new() },
+                Track { id: 3, name: "Audio 2".to_string(), is_video: false, is_muted: false, is_hidden: false, is_solo: false, volume: 1.0, clips: Vec::new() },
             ],
             playhead_secs: 0.0,
             is_playing: false,
@@ -59,6 +64,7 @@ impl EditorState {
             zoom_factor: 15.0, // 15 pixels per second default
             scroll_offset: 0.0,
             next_clip_id: 1,
+            next_track_id: 4,
         }
     }
 

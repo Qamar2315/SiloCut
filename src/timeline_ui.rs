@@ -1,5 +1,5 @@
-use crate::editor::{EditorState, Clip, EditTool};
-use egui::{pos2, Rect, Color32, Vec2, Stroke, FontId, Align2, Pos2};
+use crate::editor::{EditorState, Clip, EditTool, Track};
+use egui::{pos2, Rect, Color32, Vec2, Stroke, FontId, Align2};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum DragState {
@@ -32,11 +32,14 @@ enum DragState {
 }
 
 pub fn show_timeline(ui: &mut egui::Ui, state: &mut EditorState) {
-    let header_width = 120.0;
+    let header_width = 160.0;
     let ruler_height = 30.0;
     let track_height = 60.0;
     let track_spacing = 8.0;
-    let total_tracks = 4;
+    
+    let num_video_tracks = state.video_tracks.len();
+    let num_audio_tracks = state.audio_tracks.len();
+    let total_tracks = num_video_tracks + num_audio_tracks;
     let total_height = ruler_height + (total_tracks as f32) * (track_height + track_spacing);
 
     // 1. Toolbar and Controls
@@ -51,10 +54,40 @@ pub fn show_timeline(ui: &mut egui::Ui, state: &mut EditorState) {
 
         ui.label("Zoom:");
         ui.add(egui::Slider::new(&mut state.zoom_factor, 5.0..=100.0).show_value(true));
-        if ui.button("Reset Zoom").clicked() {
+        if ui.button("Reset").clicked() {
             state.zoom_factor = 15.0;
         }
         ui.separator();
+
+        if ui.button("➕ Video Track").clicked() {
+            let next_idx = state.video_tracks.len() + 1;
+            state.video_tracks.push(Track {
+                id: state.next_track_id,
+                name: format!("Video {}", next_idx),
+                is_video: true,
+                is_muted: false,
+                is_hidden: false,
+                is_solo: false,
+                volume: 1.0,
+                clips: Vec::new(),
+            });
+            state.next_track_id += 1;
+        }
+
+        if ui.button("➕ Audio Track").clicked() {
+            let next_idx = state.audio_tracks.len() + 1;
+            state.audio_tracks.push(Track {
+                id: state.next_track_id,
+                name: format!("Audio {}", next_idx),
+                is_video: false,
+                is_muted: false,
+                is_hidden: false,
+                is_solo: false,
+                volume: 1.0,
+                clips: Vec::new(),
+            });
+            state.next_track_id += 1;
+        }
 
         // Split selected clip at playhead button
         if let Some((is_video, track_idx, clip_idx)) = state.selected_clip {
@@ -62,10 +95,26 @@ pub fn show_timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             if track_idx < tracks.len() && clip_idx < tracks[track_idx].clips.len() {
                 let clip = &tracks[track_idx].clips[clip_idx];
                 if state.playhead_secs > clip.timeline_start && state.playhead_secs < clip.timeline_end {
-                    if ui.button("✂ Split at Playhead").clicked() {
+                    if ui.button("✂ Split").clicked() {
                         state.razor_at(is_video, track_idx, clip_idx, state.playhead_secs);
                     }
                 }
+            }
+        }
+
+        // Selected clip fades
+        if let Some((is_video, track_idx, clip_idx)) = state.selected_clip {
+            let tracks = if is_video { &mut state.video_tracks } else { &mut state.audio_tracks };
+            if track_idx < tracks.len() && clip_idx < tracks[track_idx].clips.len() {
+                let clip = &mut tracks[track_idx].clips[clip_idx];
+                ui.separator();
+                ui.label("Fades:");
+                ui.horizontal(|ui| {
+                    ui.label("In:");
+                    ui.add(egui::DragValue::new(&mut clip.fade_in_duration).speed(0.05).range(0.0..=5.0).suffix("s"));
+                    ui.label("Out:");
+                    ui.add(egui::DragValue::new(&mut clip.fade_out_duration).speed(0.05).range(0.0..=5.0).suffix("s"));
+                });
             }
         }
     });
@@ -91,6 +140,9 @@ pub fn show_timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     let max_scroll = ((timeline_width_secs as f32 * state.zoom_factor) - timeline_visible_width).max(0.0);
     state.scroll_offset = state.scroll_offset.clamp(0.0, max_scroll);
 
+    let mut video_track_to_delete = None;
+    let mut audio_track_to_delete = None;
+
     // 2. Timeline Layout (Headers + Canvas)
     ui.horizontal(|ui| {
         // Headers Column
@@ -102,16 +154,34 @@ pub fn show_timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             for (idx, track) in state.video_tracks.iter_mut().enumerate() {
                 ui.allocate_ui_with_layout(
                     Vec2::new(header_width, track_height),
-                    egui::Layout::left_to_right(egui::Align::Center),
+                    egui::Layout::top_down(egui::Align::Min),
                     |ui| {
-                        ui.vertical(|ui| {
-                            ui.label(format!("📹 Video {}", idx + 1));
-                            ui.horizontal(|ui| {
-                                if ui.button(if track.is_hidden { "🔇" } else { "👁" }).clicked() {
-                                    track.is_hidden = !track.is_hidden;
-                                }
-                                ui.label(if track.is_hidden { "Hidden" } else { "Visible" });
-                            });
+                        ui.horizontal(|ui| {
+                            ui.add(egui::TextEdit::singleline(&mut track.name)
+                                .font(FontId::proportional(11.0))
+                                .desired_width(90.0));
+                            
+                            // Mute/Hide button
+                            let hidden_text = if track.is_hidden { "🙈" } else { "👁" };
+                            if ui.selectable_label(track.is_hidden, hidden_text).on_hover_text("Hide Video Track").clicked() {
+                                track.is_hidden = !track.is_hidden;
+                            }
+
+                            // Solo button
+                            let solo_color = if track.is_solo { egui::Color32::from_rgb(250, 160, 50) } else { egui::Color32::GRAY };
+                            let solo_btn = egui::Button::new(egui::RichText::new("S").color(solo_color));
+                            if ui.add(solo_btn).on_hover_text("Solo Track").clicked() {
+                                track.is_solo = !track.is_solo;
+                            }
+
+                            // Delete track button
+                            if ui.button("❌").on_hover_text("Delete Track").clicked() {
+                                video_track_to_delete = Some(idx);
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Vol:");
+                            ui.add(egui::Slider::new(&mut track.volume, 0.0..=1.0).show_value(false));
                         });
                     }
                 );
@@ -122,16 +192,34 @@ pub fn show_timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             for (idx, track) in state.audio_tracks.iter_mut().enumerate() {
                 ui.allocate_ui_with_layout(
                     Vec2::new(header_width, track_height),
-                    egui::Layout::left_to_right(egui::Align::Center),
+                    egui::Layout::top_down(egui::Align::Min),
                     |ui| {
-                        ui.vertical(|ui| {
-                            ui.label(format!("🔊 Audio {}", idx + 1));
-                            ui.horizontal(|ui| {
-                                if ui.button(if track.is_muted { "🔇" } else { "🔊" }).clicked() {
-                                    track.is_muted = !track.is_muted;
-                                }
-                                ui.label(if track.is_muted { "Muted" } else { "Active" });
-                            });
+                        ui.horizontal(|ui| {
+                            ui.add(egui::TextEdit::singleline(&mut track.name)
+                                .font(FontId::proportional(11.0))
+                                .desired_width(90.0));
+                            
+                            // Mute button
+                            let muted_text = if track.is_muted { "🔇" } else { "🔊" };
+                            if ui.selectable_label(track.is_muted, muted_text).on_hover_text("Mute Audio Track").clicked() {
+                                track.is_muted = !track.is_muted;
+                            }
+
+                            // Solo button
+                            let solo_color = if track.is_solo { egui::Color32::from_rgb(250, 160, 50) } else { egui::Color32::GRAY };
+                            let solo_btn = egui::Button::new(egui::RichText::new("S").color(solo_color));
+                            if ui.add(solo_btn).on_hover_text("Solo Track").clicked() {
+                                track.is_solo = !track.is_solo;
+                            }
+
+                            // Delete track button
+                            if ui.button("❌").on_hover_text("Delete Track").clicked() {
+                                audio_track_to_delete = Some(idx);
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Vol:");
+                            ui.add(egui::Slider::new(&mut track.volume, 0.0..=1.0).show_value(false));
                         });
                     }
                 );
@@ -168,7 +256,7 @@ pub fn show_timeline(ui: &mut egui::Ui, state: &mut EditorState) {
         for is_video in [true, false] {
             let tracks = if is_video { &state.video_tracks } else { &state.audio_tracks };
             for track_idx in 0..tracks.len() {
-                let top_y = get_track_y(canvas_rect.top(), is_video, track_idx);
+                let top_y = get_track_y(canvas_rect.top(), is_video, track_idx, num_video_tracks);
                 let bottom_y = top_y + track_height;
                 let lane_rect = Rect::from_min_max(
                     pos2(canvas_rect.left(), top_y),
@@ -234,7 +322,7 @@ pub fn show_timeline(ui: &mut egui::Ui, state: &mut EditorState) {
         for is_video in [true, false] {
             let tracks = if is_video { &state.video_tracks } else { &state.audio_tracks };
             for (track_idx, track) in tracks.iter().enumerate() {
-                let top_y = get_track_y(canvas_rect.top(), is_video, track_idx);
+                let top_y = get_track_y(canvas_rect.top(), is_video, track_idx, num_video_tracks);
                 let bottom_y = top_y + track_height;
 
                 for (clip_idx, clip) in track.clips.iter().enumerate() {
@@ -264,6 +352,30 @@ pub fn show_timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                     };
 
                     clip_painter.rect(clip_rect, 4.0, fill_color, stroke, egui::StrokeKind::Inside);
+
+                    // Draw Fades visual overlay
+                    if clip.fade_in_duration > 0.0 {
+                        let fade_in_w = (clip.fade_in_duration as f32 * state.zoom_factor).min(clip_rect.width());
+                        let p1 = pos2(clip_rect.left(), clip_rect.bottom());
+                        let p2 = pos2(clip_rect.left() + fade_in_w, clip_rect.top());
+                        let p3 = pos2(clip_rect.left() + fade_in_w, clip_rect.bottom());
+                        clip_painter.add(egui::Shape::convex_polygon(
+                            vec![p1, p2, p3],
+                            Color32::from_white_alpha(30),
+                            Stroke::new(1.0, Color32::from_white_alpha(80)),
+                        ));
+                    }
+                    if clip.fade_out_duration > 0.0 {
+                        let fade_out_w = (clip.fade_out_duration as f32 * state.zoom_factor).min(clip_rect.width());
+                        let p1 = pos2(clip_rect.right() - fade_out_w, clip_rect.top());
+                        let p2 = pos2(clip_rect.right(), clip_rect.bottom());
+                        let p3 = pos2(clip_rect.right() - fade_out_w, clip_rect.bottom());
+                        clip_painter.add(egui::Shape::convex_polygon(
+                            vec![p1, p2, p3],
+                            Color32::from_white_alpha(30),
+                            Stroke::new(1.0, Color32::from_white_alpha(80)),
+                        ));
+                    }
 
                     // Label details
                     let asset_name = state.assets.iter()
@@ -347,7 +459,7 @@ pub fn show_timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                         'find_clip: for is_video in [true, false] {
                             let tracks = if is_video { &state.video_tracks } else { &state.audio_tracks };
                             for (track_idx, track) in tracks.iter().enumerate() {
-                                let top_y = get_track_y(canvas_rect.top(), is_video, track_idx);
+                                let top_y = get_track_y(canvas_rect.top(), is_video, track_idx, num_video_tracks);
                                 let bottom_y = top_y + track_height;
 
                                 for (clip_idx, clip) in track.clips.iter().enumerate() {
@@ -458,67 +570,69 @@ pub fn show_timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                             let mut target_end = target_start + clip_duration;
 
                             // Determine track from hover position
-                            let target_track_idx = get_hovered_track_idx(curr_pos.y, canvas_rect.top(), is_video);
+                            let target_track_idx = get_hovered_track_idx(curr_pos.y, canvas_rect.top(), is_video, num_video_tracks);
 
                             let tracks = if is_video { &mut state.video_tracks } else { &mut state.audio_tracks };
-                            let clip_to_move = tracks[orig_track_idx].clips[orig_clip_idx].clone();
-                            let target_track = &tracks[target_track_idx];
+                            if target_track_idx < tracks.len() {
+                                let clip_to_move = tracks[orig_track_idx].clips[orig_clip_idx].clone();
+                                let target_track = &tracks[target_track_idx];
 
-                            let mut valid = is_placement_valid(target_track, target_start, target_end, Some(clip_id));
+                                let mut valid = is_placement_valid(target_track, target_start, target_end, Some(clip_id));
 
-                            if !valid {
-                                // Clamp to gap/neighbors
-                                let mut sorted_clips: Vec<&Clip> = target_track.clips.iter()
-                                    .filter(|c| c.id != clip_id)
-                                    .collect();
-                                sorted_clips.sort_by(|a, b| a.timeline_start.partial_cmp(&b.timeline_start).unwrap());
+                                if !valid {
+                                    // Clamp to gap/neighbors
+                                    let mut sorted_clips: Vec<&Clip> = target_track.clips.iter()
+                                        .filter(|c| c.id != clip_id)
+                                        .collect();
+                                    sorted_clips.sort_by(|a, b| a.timeline_start.partial_cmp(&b.timeline_start).unwrap());
 
-                                let mut left_neighbor: Option<&Clip> = None;
-                                let mut right_neighbor: Option<&Clip> = None;
-                                for &c in &sorted_clips {
-                                    if c.timeline_end <= target_start {
-                                        left_neighbor = Some(c);
-                                    } else {
-                                        right_neighbor = Some(c);
-                                        break;
+                                    let mut left_neighbor: Option<&Clip> = None;
+                                    let mut right_neighbor: Option<&Clip> = None;
+                                    for &c in &sorted_clips {
+                                        if c.timeline_end <= target_start {
+                                            left_neighbor = Some(c);
+                                        } else {
+                                            right_neighbor = Some(c);
+                                            break;
+                                        }
                                     }
-                                }
 
-                                if let Some(ln) = left_neighbor {
-                                    if target_start < ln.timeline_end {
-                                        target_start = ln.timeline_end;
-                                        target_end = target_start + clip_duration;
+                                    if let Some(ln) = left_neighbor {
+                                        if target_start < ln.timeline_end {
+                                            target_start = ln.timeline_end;
+                                            target_end = target_start + clip_duration;
+                                        }
                                     }
-                                }
-                                if let Some(rn) = right_neighbor {
-                                    if target_end > rn.timeline_start {
-                                        target_start = rn.timeline_start - clip_duration;
-                                        target_end = rn.timeline_start;
+                                    if let Some(rn) = right_neighbor {
+                                        if target_end > rn.timeline_start {
+                                            target_start = rn.timeline_start - clip_duration;
+                                            target_end = rn.timeline_start;
 
-                                        if let Some(ln) = left_neighbor {
-                                            if target_start < ln.timeline_end {
-                                                // Won't fit, revert
-                                                target_start = clip_to_move.timeline_start;
+                                            if let Some(ln) = left_neighbor {
+                                                if target_start < ln.timeline_end {
+                                                    // Won't fit, revert
+                                                    target_start = clip_to_move.timeline_start;
+                                                }
                                             }
                                         }
                                     }
+
+                                    valid = is_placement_valid(target_track, target_start, target_end, Some(clip_id));
                                 }
 
-                                valid = is_placement_valid(target_track, target_start, target_start + clip_duration, Some(clip_id));
-                            }
+                                if valid && target_start >= 0.0 {
+                                    let mut updated_clip = clip_to_move;
+                                    updated_clip.timeline_start = target_start;
+                                    updated_clip.timeline_end = target_start + clip_duration;
 
-                            if valid && target_start >= 0.0 {
-                                let mut updated_clip = clip_to_move;
-                                updated_clip.timeline_start = target_start;
-                                updated_clip.timeline_end = target_start + clip_duration;
+                                    let tracks = if is_video { &mut state.video_tracks } else { &mut state.audio_tracks };
+                                    tracks[orig_track_idx].clips.remove(orig_clip_idx);
+                                    tracks[target_track_idx].clips.push(updated_clip);
+                                    tracks[target_track_idx].clips.sort_by(|a, b| a.timeline_start.partial_cmp(&b.timeline_start).unwrap());
 
-                                let tracks = if is_video { &mut state.video_tracks } else { &mut state.audio_tracks };
-                                tracks[orig_track_idx].clips.remove(orig_clip_idx);
-                                tracks[target_track_idx].clips.push(updated_clip);
-                                tracks[target_track_idx].clips.sort_by(|a, b| a.timeline_start.partial_cmp(&b.timeline_start).unwrap());
-
-                                let new_idx = tracks[target_track_idx].clips.iter().position(|c| c.id == clip_id).unwrap();
-                                state.selected_clip = Some((is_video, target_track_idx, new_idx));
+                                    let new_idx = tracks[target_track_idx].clips.iter().position(|c| c.id == clip_id).unwrap();
+                                    state.selected_clip = Some((is_video, target_track_idx, new_idx));
+                                }
                             }
                         }
                     }
@@ -626,10 +740,20 @@ pub fn show_timeline(ui: &mut egui::Ui, state: &mut EditorState) {
             ui.add(egui::Slider::new(&mut state.scroll_offset, 0.0..=max_scroll).show_value(false));
         });
     }
+
+    // Apply track deletions if triggered during rendering
+    if let Some(idx) = video_track_to_delete {
+        state.video_tracks.remove(idx);
+        state.selected_clip = None;
+    }
+    if let Some(idx) = audio_track_to_delete {
+        state.audio_tracks.remove(idx);
+        state.selected_clip = None;
+    }
 }
 
 // Helpers
-fn get_track_y(top_offset: f32, is_video: bool, track_idx: usize) -> f32 {
+fn get_track_y(top_offset: f32, is_video: bool, track_idx: usize, num_video_tracks: usize) -> f32 {
     let ruler_height = 30.0;
     let track_height = 60.0;
     let track_spacing = 8.0;
@@ -637,12 +761,11 @@ fn get_track_y(top_offset: f32, is_video: bool, track_idx: usize) -> f32 {
     if is_video {
         top_offset + ruler_height + (track_idx as f32) * (track_height + track_spacing)
     } else {
-        // Video tracks take indices 0 and 1 (2 slots)
-        top_offset + ruler_height + (2.0 + track_idx as f32) * (track_height + track_spacing)
+        top_offset + ruler_height + ((num_video_tracks + track_idx) as f32) * (track_height + track_spacing)
     }
 }
 
-fn get_hovered_track_idx(mouse_y: f32, top_offset: f32, is_video: bool) -> usize {
+fn get_hovered_track_idx(mouse_y: f32, top_offset: f32, is_video: bool, num_video_tracks: usize) -> usize {
     let ruler_height = 30.0;
     let track_height = 60.0;
     let track_spacing = 8.0;
@@ -650,19 +773,13 @@ fn get_hovered_track_idx(mouse_y: f32, top_offset: f32, is_video: bool) -> usize
     let rel_y = mouse_y - (top_offset + ruler_height);
 
     if is_video {
-        if rel_y <= track_height + track_spacing / 2.0 {
-            0
-        } else {
-            1
-        }
+        let idx = (rel_y / (track_height + track_spacing)) as usize;
+        idx.min(num_video_tracks.saturating_sub(1))
     } else {
-        let audio_offset = 2.0 * (track_height + track_spacing);
+        let audio_offset = (num_video_tracks as f32) * (track_height + track_spacing);
         let rel_audio_y = rel_y - audio_offset;
-        if rel_audio_y <= track_height + track_spacing / 2.0 {
-            0
-        } else {
-            1
-        }
+        let idx = (rel_audio_y / (track_height + track_spacing)) as usize;
+        idx
     }
 }
 
@@ -746,3 +863,4 @@ fn find_snap_time(
 
     best_snap
 }
+
