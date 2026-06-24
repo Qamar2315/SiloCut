@@ -2,6 +2,46 @@
 
 All notable changes to SiloCut are documented here.
 
+## [1.5.0] - 2026-06-23
+
+A large feature release building on the 1.4.0 fixes: project persistence, richer
+editing, a more capable recorder, and a more informative timeline.
+
+### Added
+
+- **Project save/load** to `.silocut` files (File menu + Ctrl+S / Ctrl+O). Media is
+  referenced by path; decoded audio is regenerated on load.
+- **Still-image clips** (PNG/JPEG), default 5s and freely extendable, rendered in
+  both the preview and the exporter.
+- **Audio waveforms** on audio clips and **poster thumbnails** on video/image clips
+  (decoded on a background thread).
+- **Export quality control** (Low / Medium / High) that scales the encoder bitrate.
+- **Ripple delete** (Shift+Delete) and **clip duplicate** (Ctrl+D).
+- **Zoom-to-fit** and **follow-playhead** auto-scroll during playback.
+- **Recorder options**: FPS selector (30/60), a 3-2-1 countdown, a live recording
+  timer, pause/resume, and **monitor selection** on multi-display setups.
+
+### Changed
+
+- The preview now uses the **source aspect ratio** and fits the available area
+  (previously locked to 16:9).
+- Fades animate smoothly while paused and on stills (the frame re-uploads when the
+  fade alpha changes).
+- Dropped `panic = "abort"` so a panic in a background decode/record/export worker
+  terminates only that thread, not the whole application.
+
+### Tests
+
+- Unit tests for razor / ripple-delete / duplicate and still-image metadata.
+- A fuzz test asserting the `avcC` / Annex-B parsers never panic on garbage input.
+
+### Not yet included
+
+These were scoped but deferred as larger follow-ups: picture-in-picture / clip
+transforms, cross-dissolve transitions, text/title overlays (needs a CPU font
+rasterizer), and live audio capture muxed into the MP4 (needs an AAC/Opus encoder,
+which has no production pure-Rust implementation).
+
 ## [1.4.0] - 2026-06-23
 
 This release fixes the core issues that prevented both the editor and the screen

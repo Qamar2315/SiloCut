@@ -11,6 +11,9 @@ SiloCut is an ultra-lightweight, zero-dependency standalone Non-Linear Video Edi
 ## Key Features
 
 - **Standalone Single Binary**: Zero external system dependencies, no installers, no FFmpeg DLL installations. Just download the `.exe` and run.
+- **Project Save/Load**: Persist the full timeline to a `.silocut` project file (media referenced by path; audio re-decoded on open).
+- **Still Images on the Timeline**: Drop PNG/JPEG stills in as visual clips with adjustable duration.
+- **Informative Timeline**: Audio waveforms on audio clips and poster thumbnails on video/image clips.
 - **Built-in GDI Screen Recorder**:
   - Zero-watermark, zero-dependency, full-resolution Windows screen capture.
   - Captures the mouse cursor and records at wall-clock-accurate speed (no sped-up playback when capture can't keep up).
@@ -88,7 +91,7 @@ The compiled standalone executable will be located at:
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md) for release notes. The latest release (**v1.4.0**) fixes the screen recorder, video preview, and export so they produce usable output, and adds cursor capture, accurate recording timing, and export progress.
+See [CHANGELOG.md](CHANGELOG.md) for release notes. **v1.5.0** adds project save/load, still-image clips, timeline waveforms & thumbnails, export-quality control, ripple-delete/duplicate, and recorder FPS/countdown/timer/pause/monitor selection. **v1.4.0** fixed the screen recorder, preview, and export so they produce usable output.
 
 ---
 

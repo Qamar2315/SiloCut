@@ -28,14 +28,24 @@ use symphonia::core::units::TimeBase;
 /// `screen_content` selects the desktop-capture usage profile (sharp text, large
 /// flat regions) over the camera-like profile used for general export footage.
 ///
-/// The target bitrate scales with resolution and frame rate (≈0.1 bits per pixel
-/// per second), clamped to a 1–50 Mbps window. Frame-skipping is disabled so no
-/// frames are dropped, and a keyframe is emitted roughly once per second so the
-/// output is seekable (which the editor's preview/export decoders rely on).
-pub fn build_encoder(width: u32, height: u32, fps: u32, screen_content: bool) -> Result<Encoder, String> {
+/// `quality_scale` multiplies the auto-computed bitrate (1.0 = default; the export
+/// dialog maps Low/Medium/High to 0.5/1.0/2.0).
+///
+/// The base bitrate scales with resolution and frame rate (≈0.1 bits per pixel per
+/// second). Frame-skipping is disabled so no frames are dropped, and a keyframe is
+/// emitted roughly once per second so the output is seekable.
+pub fn build_encoder(
+    width: u32,
+    height: u32,
+    fps: u32,
+    screen_content: bool,
+    quality_scale: f32,
+) -> Result<Encoder, String> {
     let fps = fps.max(1);
     let pixels = width as u64 * height as u64;
-    let bitrate = (pixels.saturating_mul(fps as u64) / 10).clamp(1_000_000, 50_000_000) as u32;
+    let base = pixels.saturating_mul(fps as u64) / 10;
+    let bitrate = (base as f64 * quality_scale.clamp(0.1, 8.0) as f64)
+        .clamp(500_000.0, 80_000_000.0) as u32;
 
     let config = EncoderConfig::new()
         .bitrate(BitRate::from_bps(bitrate))
@@ -225,6 +235,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_avcc_and_to_annex_b_never_panic_on_garbage() {
+        // Deterministic pseudo-random fuzz of the untrusted-input parsers.
+        let mut seed = 0x1234_5678u32;
+        let mut rng = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            seed
+        };
+        for _ in 0..4000 {
+            let len = (rng() % 96) as usize;
+            let data: Vec<u8> = (0..len).map(|_| (rng() & 0xff) as u8).collect();
+            let _ = parse_avcc(&data);
+            let _ = to_annex_b(&data, ((rng() % 4) + 1) as usize);
+        }
+    }
+
+    #[test]
     fn to_annex_b_converts_length_prefixed() {
         let nal = [0x65u8, 0x11, 0x22, 0x33];
         let mut data = (nal.len() as u32).to_be_bytes().to_vec();
@@ -247,7 +273,7 @@ mod tests {
             let mut cursor = Cursor::new(&mut buf);
             let mut muxer = mp4e::Mp4e::new(&mut cursor);
             muxer.set_video_track(w, h, mp4e::Codec::AVC);
-            let mut encoder = build_encoder(w, h, fps, true).expect("encoder");
+            let mut encoder = build_encoder(w, h, fps, true, 1.0).expect("encoder");
             let mut bitstream = Vec::new();
             for f in 0..15 {
                 let rgb = synth_rgb(w, h, f);

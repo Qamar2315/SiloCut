@@ -14,7 +14,56 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN,
     GetCursorInfo, GetIconInfo, DrawIconEx, CURSORINFO, ICONINFO, CURSOR_SHOWING, DI_NORMAL,
 };
-use windows_sys::Win32::Foundation::HWND;
+use windows_sys::Win32::Graphics::Gdi::{
+    EnumDisplayMonitors, GetMonitorInfoW, MONITORINFO, HMONITOR,
+};
+
+// MONITORINFOF_PRIMARY is not re-exported by windows-sys 0.52; its value is 1.
+const MONITORINFOF_PRIMARY: u32 = 1;
+use windows_sys::Win32::Foundation::{HWND, RECT, LPARAM, BOOL};
+
+/// Information about a connected display, used by the recorder's monitor picker.
+#[derive(Clone)]
+pub struct MonitorInfo {
+    pub label: String,
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+/// Enumerate connected monitors in virtual-screen coordinates.
+pub fn list_monitors() -> Vec<MonitorInfo> {
+    unsafe extern "system" fn enum_cb(hmon: HMONITOR, _hdc: HDC, _rc: *mut RECT, data: LPARAM) -> BOOL {
+        let monitors = &mut *(data as *mut Vec<MonitorInfo>);
+        let mut mi: MONITORINFO = std::mem::zeroed();
+        mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(hmon, &mut mi) != 0 {
+            let r = mi.rcMonitor;
+            let is_primary = (mi.dwFlags & MONITORINFOF_PRIMARY) != 0;
+            let idx = monitors.len() + 1;
+            monitors.push(MonitorInfo {
+                label: format!("Monitor {}{}", idx, if is_primary { " (primary)" } else { "" }),
+                x: r.left,
+                y: r.top,
+                width: r.right - r.left,
+                height: r.bottom - r.top,
+            });
+        }
+        1 // continue enumeration
+    }
+
+    let mut monitors: Vec<MonitorInfo> = Vec::new();
+    unsafe {
+        EnumDisplayMonitors(
+            0,
+            std::ptr::null(),
+            Some(enum_cb),
+            &mut monitors as *mut Vec<MonitorInfo> as LPARAM,
+        );
+    }
+    monitors
+}
 
 /// Composites the current mouse cursor onto `hdc` at its on-screen position so the
 /// recording includes the pointer. Best-effort: does nothing if the cursor is
@@ -72,6 +121,7 @@ impl Drop for RecordingGuard {
 
 pub struct ScreenRecorder {
     is_recording: Arc<AtomicBool>,
+    is_paused: Arc<AtomicBool>,
     thread_handle: Option<std::thread::JoinHandle<Result<PathBuf, String>>>,
 }
 
@@ -79,23 +129,39 @@ impl ScreenRecorder {
     pub fn new() -> Self {
         Self {
             is_recording: Arc::new(AtomicBool::new(false)),
+            is_paused: Arc::new(AtomicBool::new(false)),
             thread_handle: None,
         }
     }
 
-    pub fn start(&mut self, output_path: PathBuf, fps: u32) -> Result<(), String> {
+    /// Start recording. `region` is the capture rectangle in virtual-screen
+    /// coordinates `(x, y, w, h)`; `None` captures the primary monitor.
+    pub fn start(
+        &mut self,
+        output_path: PathBuf,
+        fps: u32,
+        region: Option<(i32, i32, i32, i32)>,
+    ) -> Result<(), String> {
         if self.is_recording.load(Ordering::SeqCst) {
             return Err("Recording is already in progress.".to_string());
         }
 
         let is_recording = self.is_recording.clone();
+        let is_paused = self.is_paused.clone();
+        is_paused.store(false, Ordering::SeqCst);
         is_recording.store(true, Ordering::SeqCst);
 
         let handle = std::thread::spawn(move || -> Result<PathBuf, String> {
             let _recording_guard = RecordingGuard(is_recording.clone());
-            let width = unsafe { GetSystemMetrics(SM_CXSCREEN) } as usize;
-            let height = unsafe { GetSystemMetrics(SM_CYSCREEN) } as usize;
-            
+            let (cap_x, cap_y, width, height) = match region {
+                Some((x, y, w, h)) => (x, y, w.max(2) as usize, h.max(2) as usize),
+                None => {
+                    let w = unsafe { GetSystemMetrics(SM_CXSCREEN) } as usize;
+                    let h = unsafe { GetSystemMetrics(SM_CYSCREEN) } as usize;
+                    (0, 0, w, h)
+                }
+            };
+
             // Width and height must be even for OpenH264 encoding
             let width = width & !1;
             let height = height & !1;
@@ -146,7 +212,7 @@ impl ScreenRecorder {
             // Setup H.264 Encoder tuned for screen capture. The OpenH264 default
             // (120 kbps, frame-skipping on, no periodic keyframes) is unusable for
             // full-screen recording; see `codec::build_encoder`.
-            let mut encoder = crate::codec::build_encoder(width as u32, height as u32, fps, true)?;
+            let mut encoder = crate::codec::build_encoder(width as u32, height as u32, fps, true, 1.0)?;
 
             // Bitmap Info Header for GetDIBits
             let mut bmi = BITMAPINFO {
@@ -181,13 +247,21 @@ impl ScreenRecorder {
             while is_recording.load(Ordering::SeqCst) {
                 let frame_start = Instant::now();
 
+                // While paused, capture nothing and don't count the elapsed time
+                // toward the next frame's duration.
+                if is_paused.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(30));
+                    prev_capture = Instant::now();
+                    continue;
+                }
+
                 // 1. GDI Capture
                 unsafe {
                     BitBlt(
                         hdc_mem,
                         0, 0, width as i32, height as i32,
                         hdc_screen,
-                        0, 0,
+                        cap_x, cap_y,
                         SRCCOPY,
                     );
 
@@ -270,6 +344,18 @@ impl ScreenRecorder {
     pub fn is_recording(&self) -> bool {
         self.is_recording.load(Ordering::SeqCst)
     }
+
+    pub fn pause(&self) {
+        self.is_paused.store(true, Ordering::SeqCst);
+    }
+
+    pub fn resume(&self) {
+        self.is_paused.store(false, Ordering::SeqCst);
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.is_paused.load(Ordering::SeqCst)
+    }
 }
 
 #[cfg(test)]
@@ -286,7 +372,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("silocut_rec_test_{}.mp4", std::process::id()));
 
         let mut rec = ScreenRecorder::new();
-        rec.start(tmp.clone(), 15).expect("start recording");
+        rec.start(tmp.clone(), 15, None).expect("start recording");
         std::thread::sleep(Duration::from_millis(1200));
         let path = rec.stop().expect("stop recording");
 

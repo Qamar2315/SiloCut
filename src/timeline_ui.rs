@@ -31,7 +31,11 @@ enum DragState {
     },
 }
 
-pub fn show_timeline(ui: &mut egui::Ui, state: &mut EditorState) {
+pub fn show_timeline(
+    ui: &mut egui::Ui,
+    state: &mut EditorState,
+    thumbs: &std::collections::HashMap<usize, egui::TextureHandle>,
+) {
     let header_width = 160.0;
     let ruler_height = 30.0;
     let track_height = 60.0;
@@ -56,6 +60,17 @@ pub fn show_timeline(ui: &mut egui::Ui, state: &mut EditorState) {
         ui.add(egui::Slider::new(&mut state.zoom_factor, 5.0..=100.0).show_value(true));
         if ui.button("Reset").clicked() {
             state.zoom_factor = 15.0;
+        }
+        if ui.button("Fit").clicked() {
+            let mut max_t = 1.0f64;
+            for tr in state.video_tracks.iter().chain(state.audio_tracks.iter()) {
+                for c in &tr.clips {
+                    max_t = max_t.max(c.timeline_end);
+                }
+            }
+            let visible = (ui.ctx().content_rect().width() - header_width - 16.0).max(200.0);
+            state.zoom_factor = (visible / max_t as f32).clamp(5.0, 100.0);
+            state.scroll_offset = 0.0;
         }
         ui.separator();
 
@@ -139,6 +154,20 @@ pub fn show_timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     let timeline_visible_width = ui.available_width() - header_width - 16.0;
     let max_scroll = ((timeline_width_secs as f32 * state.zoom_factor) - timeline_visible_width).max(0.0);
     state.scroll_offset = state.scroll_offset.clamp(0.0, max_scroll);
+
+    // During playback, auto-scroll so the playhead stays visible.
+    if state.is_playing && max_scroll > 0.0 {
+        let playhead_x = state.playhead_secs as f32 * state.zoom_factor - state.scroll_offset;
+        let margin = 40.0;
+        if playhead_x > timeline_visible_width - margin {
+            state.scroll_offset =
+                (state.playhead_secs as f32 * state.zoom_factor - (timeline_visible_width - margin))
+                    .clamp(0.0, max_scroll);
+        } else if playhead_x < margin {
+            state.scroll_offset =
+                (state.playhead_secs as f32 * state.zoom_factor - margin).clamp(0.0, max_scroll);
+        }
+    }
 
     let mut video_track_to_delete = None;
     let mut audio_track_to_delete = None;
@@ -377,16 +406,40 @@ pub fn show_timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                         ));
                     }
 
+                    // Per-clip visuals: a waveform for audio-track clips, or a poster
+                    // thumbnail at the left of video/image clips.
+                    let asset = state.assets.iter().find(|a| a.id == clip.asset_id);
+                    let mut label_x = x_start + 6.0;
+                    if !is_video {
+                        if let Some(asset) = asset {
+                            if let Some(ref samples) = asset.audio_samples {
+                                draw_waveform(&clip_painter, clip_rect, clip, asset, samples);
+                            }
+                        }
+                    } else if let Some(tex) = thumbs.get(&clip.asset_id) {
+                        let sz = tex.size();
+                        let aspect = sz[0] as f32 / (sz[1].max(1) as f32);
+                        let pw = (aspect * clip_rect.height()).min(clip_rect.width());
+                        let poster =
+                            Rect::from_min_max(clip_rect.min, pos2(clip_rect.left() + pw, clip_rect.bottom()));
+                        clip_painter.image(
+                            tex.id(),
+                            poster,
+                            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                            Color32::WHITE,
+                        );
+                        label_x = (clip_rect.left() + pw + 4.0).min(clip_rect.right());
+                    }
+
                     // Label details
-                    let asset_name = state.assets.iter()
-                        .find(|a| a.id == clip.asset_id)
+                    let asset_name = asset
                         .map(|a| a.name.clone())
                         .unwrap_or_else(|| format!("Clip {}", clip.id));
                     let label_text = format!("{} [{:.1}s - {:.1}s]", asset_name, clip.source_trim_start, clip.source_trim_end);
 
                     let text_painter = clip_painter.with_clip_rect(clip_rect);
                     text_painter.text(
-                        pos2(x_start + 6.0, top_y + track_height / 2.0),
+                        pos2(label_x, top_y + track_height / 2.0),
                         Align2::LEFT_CENTER,
                         label_text,
                         FontId::proportional(11.0),
@@ -695,7 +748,9 @@ pub fn show_timeline(ui: &mut egui::Ui, state: &mut EditorState) {
                                 let clip = &tracks[track_idx].clips[clip_idx];
                                 state.assets.iter()
                                     .find(|a| a.id == clip.asset_id)
-                                    .map(|a| a.duration_secs)
+                                    // Still images have no real source length, so allow
+                                    // extending them freely on the timeline.
+                                    .map(|a| if a.is_image { 86_400.0 } else { a.duration_secs })
                                     .unwrap_or(3600.0)
                             };
 
@@ -749,6 +804,40 @@ pub fn show_timeline(ui: &mut egui::Ui, state: &mut EditorState) {
     if let Some(idx) = audio_track_to_delete {
         state.audio_tracks.remove(idx);
         state.selected_clip = None;
+    }
+}
+
+// Draw a translucent amplitude waveform of `samples` across the clip's body,
+// mapped over the clip's source trim range.
+fn draw_waveform(
+    painter: &egui::Painter,
+    rect: Rect,
+    clip: &Clip,
+    asset: &crate::media::MediaAsset,
+    samples: &[f32],
+) {
+    let channels = asset.audio_channels.max(1) as usize;
+    let sr = asset.audio_sample_rate.max(1) as f64;
+    let mid_y = rect.center().y;
+    let half_h = (rect.height() * 0.5 - 3.0).max(1.0);
+    let span = (clip.source_trim_end - clip.source_trim_start).max(1e-6);
+    let w = rect.width().max(1.0);
+    let color = Color32::from_rgba_unmultiplied(230, 255, 240, 70);
+
+    let mut x = rect.left();
+    while x < rect.right() {
+        let f = ((x - rect.left()) / w).clamp(0.0, 1.0) as f64;
+        let src_t = clip.source_trim_start + f * span;
+        let idx = (src_t * sr) as usize * channels;
+        let amp = samples.get(idx).copied().unwrap_or(0.0).abs().min(1.0);
+        let h = amp * half_h;
+        if h > 0.5 {
+            painter.line_segment(
+                [pos2(x, mid_y - h), pos2(x, mid_y + h)],
+                Stroke::new(1.0, color),
+            );
+        }
+        x += 2.0;
     }
 }
 

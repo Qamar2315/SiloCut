@@ -36,6 +36,10 @@ pub struct PreviewEngine {
     current_frame_key: Option<(usize, usize)>,
     last_requested_frame: Option<(usize, usize)>,
     frame_cache: std::collections::HashMap<(usize, usize), CachedFrame>,
+    // Cache of decoded still images (asset_id -> rgba, width, height).
+    image_cache: std::collections::HashMap<usize, (std::sync::Arc<Vec<u8>>, usize, usize)>,
+    // Alpha used for the last uploaded frame, so fades re-upload as alpha changes.
+    last_alpha: f32,
     cmd_tx: Sender<DecoderCommand>,
     resp_rx: Receiver<DecodedFrameResponse>,
     
@@ -85,6 +89,18 @@ fn yuv420p_to_rgba(
                 row_rgba[offset + 3] = 255;
             }
         });
+}
+
+// Compute a clip's opacity at `playhead` from its fade-in / fade-out durations.
+fn fade_alpha(clip: &crate::editor::Clip, playhead: f64) -> f32 {
+    let mut alpha = 1.0f32;
+    if clip.fade_in_duration > 0.0 && (playhead - clip.timeline_start) < clip.fade_in_duration {
+        alpha *= ((playhead - clip.timeline_start) / clip.fade_in_duration) as f32;
+    }
+    if clip.fade_out_duration > 0.0 && (clip.timeline_end - playhead) < clip.fade_out_duration {
+        alpha *= ((clip.timeline_end - playhead) / clip.fade_out_duration) as f32;
+    }
+    alpha.clamp(0.0, 1.0)
 }
 
 impl PreviewEngine {
@@ -252,6 +268,8 @@ impl PreviewEngine {
             current_frame_key: None,
             last_requested_frame: None,
             frame_cache: std::collections::HashMap::new(),
+            image_cache: std::collections::HashMap::new(),
+            last_alpha: 1.0,
             cmd_tx,
             resp_rx,
             audio_sink,
@@ -308,26 +326,25 @@ impl PreviewEngine {
             self.frame_cache.clear();
         }
 
-        // 3. Request video frame decode/fetch
+        // 3. Produce the preview frame for the active visual clip.
         if let Some((clip, asset, source_time)) = self.get_active_video_clip_and_time(state, state.playhead_secs) {
-            let frame_idx = (source_time * asset.fps).round() as usize;
-            let frame_key = (asset.id, frame_idx);
+            let alpha = fade_alpha(clip, state.playhead_secs);
 
-            if self.frame_cache.contains_key(&frame_key) {
-                // Instantly upload texture if frame is cached and not currently displayed
-                if self.current_frame_key != Some(frame_key) {
-                    if let Some(cached) = self.frame_cache.get(&frame_key) {
-                        let playhead = state.playhead_secs;
-                        let mut alpha = 1.0f32;
-                        if clip.fade_in_duration > 0.0 && (playhead - clip.timeline_start) < clip.fade_in_duration {
-                            alpha *= ((playhead - clip.timeline_start) / clip.fade_in_duration) as f32;
+            if asset.is_image {
+                // Still image: decode once, cache, and (re)upload when alpha changes.
+                let frame_key = (asset.id, 0usize);
+                if self.current_frame_key != Some(frame_key) || (self.last_alpha - alpha).abs() > 0.01 {
+                    if !self.image_cache.contains_key(&asset.id) {
+                        if let Ok(img) = image::open(&asset.path) {
+                            let rgba = img.to_rgba8();
+                            let (w, h) = (rgba.width() as usize, rgba.height() as usize);
+                            self.image_cache
+                                .insert(asset.id, (std::sync::Arc::new(rgba.into_raw()), w, h));
                         }
-                        if clip.fade_out_duration > 0.0 && (clip.timeline_end - playhead) < clip.fade_out_duration {
-                            alpha *= ((clip.timeline_end - playhead) / clip.fade_out_duration) as f32;
-                        }
-                        alpha = alpha.clamp(0.0, 1.0);
-
-                        let mut rgba = cached.rgba.clone();
+                    }
+                    if let Some((rgba_arc, w, h)) = self.image_cache.get(&asset.id) {
+                        let (w, h) = (*w, *h);
+                        let mut rgba = (**rgba_arc).clone();
                         if alpha < 1.0 {
                             rgba.par_chunks_exact_mut(4).for_each(|pixel| {
                                 pixel[0] = (pixel[0] as f32 * alpha) as u8;
@@ -335,28 +352,48 @@ impl PreviewEngine {
                                 pixel[2] = (pixel[2] as f32 * alpha) as u8;
                             });
                         }
-
-                        let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                            [cached.width, cached.height],
-                            &rgba
-                        );
-                        self.current_texture = Some(ctx.load_texture(
-                            "video_preview",
-                            color_image,
-                            Default::default()
-                        ));
+                        let color_image = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
+                        self.current_texture =
+                            Some(ctx.load_texture("video_preview", color_image, Default::default()));
                         self.current_frame_key = Some(frame_key);
+                        self.last_alpha = alpha;
                     }
                 }
             } else {
-                // Request frame from background thread if not already sent
-                if self.last_requested_frame != Some(frame_key) {
-                    let _ = self.cmd_tx.send(DecoderCommand::RequestFrame {
-                        asset_id: asset.id,
-                        path: asset.path.clone(),
-                        target_secs: source_time,
-                    });
-                    self.last_requested_frame = Some(frame_key);
+                let frame_idx = (source_time * asset.fps).round() as usize;
+                let frame_key = (asset.id, frame_idx);
+
+                if self.frame_cache.contains_key(&frame_key) {
+                    if self.current_frame_key != Some(frame_key) || (self.last_alpha - alpha).abs() > 0.01 {
+                        if let Some(cached) = self.frame_cache.get(&frame_key) {
+                            let mut rgba = cached.rgba.clone();
+                            if alpha < 1.0 {
+                                rgba.par_chunks_exact_mut(4).for_each(|pixel| {
+                                    pixel[0] = (pixel[0] as f32 * alpha) as u8;
+                                    pixel[1] = (pixel[1] as f32 * alpha) as u8;
+                                    pixel[2] = (pixel[2] as f32 * alpha) as u8;
+                                });
+                            }
+                            let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                                [cached.width, cached.height],
+                                &rgba,
+                            );
+                            self.current_texture =
+                                Some(ctx.load_texture("video_preview", color_image, Default::default()));
+                            self.current_frame_key = Some(frame_key);
+                            self.last_alpha = alpha;
+                        }
+                    }
+                } else {
+                    // Request the frame from the background decoder thread.
+                    if self.last_requested_frame != Some(frame_key) {
+                        let _ = self.cmd_tx.send(DecoderCommand::RequestFrame {
+                            asset_id: asset.id,
+                            path: asset.path.clone(),
+                            target_secs: source_time,
+                        });
+                        self.last_requested_frame = Some(frame_key);
+                    }
                 }
             }
         } else {
@@ -378,16 +415,7 @@ impl PreviewEngine {
                 let current_idx = (source_time * asset.fps).round() as usize;
                 if (asset.id, current_idx) == frame_key {
                     if let Some(cached) = self.frame_cache.get(&frame_key) {
-                        let playhead = state.playhead_secs;
-                        let mut alpha = 1.0f32;
-                        if clip.fade_in_duration > 0.0 && (playhead - clip.timeline_start) < clip.fade_in_duration {
-                            alpha *= ((playhead - clip.timeline_start) / clip.fade_in_duration) as f32;
-                        }
-                        if clip.fade_out_duration > 0.0 && (clip.timeline_end - playhead) < clip.fade_out_duration {
-                            alpha *= ((clip.timeline_end - playhead) / clip.fade_out_duration) as f32;
-                        }
-                        alpha = alpha.clamp(0.0, 1.0);
-
+                        let alpha = fade_alpha(clip, state.playhead_secs);
                         let mut rgba = cached.rgba.clone();
                         if alpha < 1.0 {
                             rgba.par_chunks_exact_mut(4).for_each(|pixel| {
@@ -407,6 +435,7 @@ impl PreviewEngine {
                             Default::default()
                         ));
                         self.current_frame_key = Some(frame_key);
+                        self.last_alpha = alpha;
                     }
                 }
             }

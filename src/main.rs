@@ -7,6 +7,7 @@ mod preview;
 mod export;
 mod recorder;
 mod codec;
+mod thumbnail;
 
 use editor::EditorState;
 use preview::PreviewEngine;
@@ -16,12 +17,19 @@ struct SiloCutApp {
     state: EditorState,
     preview: PreviewEngine,
     recorder: recorder::ScreenRecorder,
+    record_fps: u32,
+    record_monitor: usize,
+    record_countdown: Option<std::time::Instant>,
+    pending_record_path: Option<PathBuf>,
+    pending_record_region: Option<(i32, i32, i32, i32)>,
+    recording_started: Option<std::time::Instant>,
     export_in_progress: bool,
     export_status: String,
     show_export_dialog: bool,
     export_width: u32,
     export_height: u32,
     export_fps: u32,
+    export_quality_scale: f32,
     export_path: Option<PathBuf>,
     
     // Undo/Redo history stacks
@@ -31,6 +39,8 @@ struct SiloCutApp {
     // Pre-interaction snapshot, used to coalesce a continuous drag into a single
     // undo entry (captured on pointer-down, committed on release).
     interaction_baseline: Option<EditorState>,
+    // Path of the currently-open .silocut project (None if never saved).
+    current_project_path: Option<PathBuf>,
 
     // Channel receiver for background export thread
     export_rx: Option<std::sync::mpsc::Receiver<Result<PathBuf, String>>>,
@@ -42,6 +52,11 @@ struct SiloCutApp {
     audio_decode_rx: std::sync::mpsc::Receiver<(usize, Result<Vec<f32>, String>)>,
     audio_decode_tx: std::sync::mpsc::Sender<(usize, Result<Vec<f32>, String>)>,
     decoding_assets: std::collections::HashSet<usize>,
+
+    // Background timeline thumbnail generation.
+    thumbnails: thumbnail::ThumbnailService,
+    thumb_textures: std::collections::HashMap<usize, egui::TextureHandle>,
+    thumb_requested: std::collections::HashSet<usize>,
 }
 
 impl SiloCutApp {
@@ -58,23 +73,34 @@ impl SiloCutApp {
             state: EditorState::new(),
             preview: PreviewEngine::new(),
             recorder: recorder::ScreenRecorder::new(),
+            record_fps: 30,
+            record_monitor: 0,
+            record_countdown: None,
+            pending_record_path: None,
+            pending_record_region: None,
+            recording_started: None,
             export_in_progress: false,
             export_status: String::new(),
             show_export_dialog: false,
             export_width: 1920,
             export_height: 1080,
             export_fps: 30,
+            export_quality_scale: 1.0,
             export_path: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             skip_undo_save: false,
             interaction_baseline: None,
+            current_project_path: None,
             export_rx: None,
             export_progress: 0.0,
             export_progress_rx: None,
             audio_decode_rx,
             audio_decode_tx,
             decoding_assets: std::collections::HashSet::new(),
+            thumbnails: thumbnail::ThumbnailService::new(),
+            thumb_textures: std::collections::HashMap::new(),
+            thumb_requested: std::collections::HashSet::new(),
         }
     }
 
@@ -116,6 +142,95 @@ impl SiloCutApp {
             self.skip_undo_save = true;
         }
     }
+
+    /// Reset to an empty project.
+    fn new_project(&mut self) {
+        self.preview.stop_playback(&mut self.state);
+        self.state = EditorState::new();
+        self.decoding_assets.clear();
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.interaction_baseline = None;
+        self.current_project_path = None;
+        self.skip_undo_save = true;
+        self.export_status = "New project".to_string();
+    }
+
+    /// Serialize the timeline to a `.silocut` (JSON) project file. Media is
+    /// referenced by path; decoded audio is re-derived on load, not stored.
+    fn save_project(&mut self, path: PathBuf) {
+        match serde_json::to_string_pretty(&self.state) {
+            Ok(json) => match std::fs::write(&path, json) {
+                Ok(()) => {
+                    let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                    self.current_project_path = Some(path);
+                    self.export_status = format!("Saved project: {}", name);
+                }
+                Err(e) => self.export_status = format!("Save failed: {}", e),
+            },
+            Err(e) => self.export_status = format!("Save failed (serialize): {}", e),
+        }
+    }
+
+    /// Save to the current project path, prompting for one if never saved.
+    fn save_project_as_or_current(&mut self) {
+        if let Some(path) = self.current_project_path.clone() {
+            self.save_project(path);
+        } else if let Some(path) = rfd::FileDialog::new()
+            .add_filter("SiloCut Project", &["silocut"])
+            .set_file_name("project.silocut")
+            .save_file()
+        {
+            self.save_project(path);
+        }
+    }
+
+    /// Load a `.silocut` project and re-decode audio for its assets.
+    fn load_project(&mut self, path: PathBuf) {
+        let json = match std::fs::read_to_string(&path) {
+            Ok(j) => j,
+            Err(e) => {
+                self.export_status = format!("Open failed: {}", e);
+                return;
+            }
+        };
+        let mut state: EditorState = match serde_json::from_str(&json) {
+            Ok(s) => s,
+            Err(e) => {
+                self.export_status = format!("Open failed (parse): {}", e);
+                return;
+            }
+        };
+
+        state.is_playing = false;
+        state.selected_clip = None;
+
+        // Audio samples aren't stored in the project file; re-decode them.
+        self.decoding_assets.clear();
+        for asset in &state.assets {
+            if asset.audio_channels > 0 && asset.audio_sample_rate > 0 {
+                self.decoding_assets.insert(asset.id);
+                let p = asset.path.clone();
+                let id = asset.id;
+                let tx = self.audio_decode_tx.clone();
+                std::thread::spawn(move || {
+                    let res = media::MediaAsset::decode_audio_samples(&p);
+                    let _ = tx.send((id, res));
+                });
+            }
+        }
+
+        self.state = state;
+        let playhead = self.state.playhead_secs;
+        self.preview.seek_to(&mut self.state, playhead);
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.interaction_baseline = None;
+        self.skip_undo_save = true;
+        let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+        self.current_project_path = Some(path);
+        self.export_status = format!("Opened project: {}", name);
+    }
 }
 
 impl eframe::App for SiloCutApp {
@@ -124,7 +239,12 @@ impl eframe::App for SiloCutApp {
         // ctx-level calls while passing `ui` mutably to the panels' `show_inside`.
         let ctx = ui.ctx().clone();
 
-        if self.recorder.is_recording() || !self.decoding_assets.is_empty() || self.export_in_progress {
+        if self.recorder.is_recording()
+            || !self.decoding_assets.is_empty()
+            || self.export_in_progress
+            || self.record_countdown.is_some()
+            || self.thumb_textures.len() < self.thumb_requested.len()
+        {
             ctx.request_repaint();
         }
 
@@ -133,6 +253,19 @@ impl eframe::App for SiloCutApp {
             while let Ok(p) = prx.try_recv() {
                 self.export_progress = p;
             }
+        }
+
+        // Request timeline thumbnails for visual assets, and ingest finished ones.
+        for asset in &self.state.assets {
+            if (asset.is_video || asset.is_image) && !self.thumb_requested.contains(&asset.id) {
+                self.thumb_requested.insert(asset.id);
+                self.thumbnails.request(asset.id, asset.path.clone(), asset.is_image);
+            }
+        }
+        while let Ok(resp) = self.thumbnails.rx.try_recv() {
+            let color = egui::ColorImage::from_rgba_unmultiplied([resp.width, resp.height], &resp.rgba);
+            let tex = ctx.load_texture(format!("thumb_{}", resp.asset_id), color, Default::default());
+            self.thumb_textures.insert(resp.asset_id, tex);
         }
 
         // Receive background audio decoding updates
@@ -235,14 +368,26 @@ impl eframe::App for SiloCutApp {
                 self.preview.seek_to(&mut self.state, new_time);
             }
 
-            // Delete or Backspace: Remove selected clip
+            // Delete / Backspace: remove selected clip (Shift = ripple delete,
+            // closing the gap by shifting later clips on the track left).
             if ctx.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)) {
                 if let Some((is_video, track_idx, clip_idx)) = self.state.selected_clip {
-                    let tracks = if is_video { &mut self.state.video_tracks } else { &mut self.state.audio_tracks };
-                    if track_idx < tracks.len() && clip_idx < tracks[track_idx].clips.len() {
-                        tracks[track_idx].clips.remove(clip_idx);
-                        self.state.selected_clip = None;
+                    if ctx.input(|i| i.modifiers.shift) {
+                        self.state.ripple_delete(is_video, track_idx, clip_idx);
+                    } else {
+                        let tracks = if is_video { &mut self.state.video_tracks } else { &mut self.state.audio_tracks };
+                        if track_idx < tracks.len() && clip_idx < tracks[track_idx].clips.len() {
+                            tracks[track_idx].clips.remove(clip_idx);
+                            self.state.selected_clip = None;
+                        }
                     }
+                }
+            }
+
+            // Ctrl+D: duplicate selected clip
+            if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::D)) {
+                if let Some((is_video, track_idx, clip_idx)) = self.state.selected_clip {
+                    self.state.duplicate_clip(is_video, track_idx, clip_idx);
                 }
             }
 
@@ -255,15 +400,58 @@ impl eframe::App for SiloCutApp {
             if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Y)) {
                 self.redo();
             }
+
+            // Ctrl+S: Save project
+            if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S)) {
+                self.save_project_as_or_current();
+            }
+
+            // Ctrl+O: Open project
+            if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::O)) {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("SiloCut Project", &["silocut"])
+                    .pick_file()
+                {
+                    self.load_project(path);
+                }
+            }
         }
 
         // Top Menu Bar
         egui::Panel::top("menu_bar").show_inside(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
+                    if ui.button("New Project").clicked() {
+                        self.new_project();
+                        ui.close();
+                    }
+                    if ui.button("Open Project... (Ctrl+O)").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("SiloCut Project", &["silocut"])
+                            .pick_file()
+                        {
+                            self.load_project(path);
+                        }
+                        ui.close();
+                    }
+                    if ui.button("Save Project (Ctrl+S)").clicked() {
+                        self.save_project_as_or_current();
+                        ui.close();
+                    }
+                    if ui.button("Save Project As...").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("SiloCut Project", &["silocut"])
+                            .set_file_name("project.silocut")
+                            .save_file()
+                        {
+                            self.save_project(path);
+                        }
+                        ui.close();
+                    }
+                    ui.separator();
                     if ui.button("Import Media...").clicked() {
                         if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Media Files", &["mp4", "mkv", "mov", "wav", "mp3"])
+                            .add_filter("Media Files", &["mp4", "mkv", "mov", "wav", "mp3", "png", "jpg", "jpeg"])
                             .pick_file()
                         {
                             let next_id = self.state.assets.len();
@@ -329,7 +517,7 @@ impl eframe::App for SiloCutApp {
                     } else if !self.export_status.is_empty() {
                         ui.label(&self.export_status);
                     } else {
-                        ui.label("SiloCut v1.4");
+                        ui.label("SiloCut v1.5");
                     }
                 });
             });
@@ -340,7 +528,7 @@ impl eframe::App for SiloCutApp {
             .resizable(true)
             .default_size(250.0)
             .show_inside(ui, |ui| {
-                timeline_ui::show_timeline(ui, &mut self.state);
+                timeline_ui::show_timeline(ui, &mut self.state, &self.thumb_textures);
             });
 
         // Left Panel - Media Bin
@@ -354,19 +542,39 @@ impl eframe::App for SiloCutApp {
                 // Screen Recorder Section
                 ui.group(|ui| {
                     ui.label(egui::RichText::new("Screen Recorder").strong());
-                    ui.horizontal(|ui| {
-                        if self.recorder.is_recording() {
-                            // Flashing red dot
+
+                    if self.recorder.is_recording() {
+                        ui.horizontal(|ui| {
+                            // Flashing status dot.
                             let time = ui.input(|i| i.time);
                             let alpha = (((time * 5.0).sin() + 1.0) * 127.5) as u8;
                             let dot_color = egui::Color32::from_rgba_unmultiplied(239, 68, 68, alpha);
-                            
                             let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
                             ui.painter().circle_filled(rect.center(), 5.0, dot_color);
-                            
-                            ui.label(egui::RichText::new("REC").color(egui::Color32::from_rgb(239, 68, 68)).strong());
-                            
-                            if ui.button("Stop").clicked() {
+
+                            let paused = self.recorder.is_paused();
+                            let (label, col) = if paused {
+                                ("PAUSED", egui::Color32::from_rgb(250, 190, 60))
+                            } else {
+                                ("REC", egui::Color32::from_rgb(239, 68, 68))
+                            };
+                            ui.label(egui::RichText::new(label).color(col).strong());
+                            if let Some(start) = self.recording_started {
+                                let s = start.elapsed().as_secs();
+                                ui.monospace(format!("{:02}:{:02}", s / 60, s % 60));
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            let pause_label = if self.recorder.is_paused() { "▶ Resume" } else { "⏸ Pause" };
+                            if ui.button(pause_label).clicked() {
+                                if self.recorder.is_paused() {
+                                    self.recorder.resume();
+                                } else {
+                                    self.recorder.pause();
+                                }
+                            }
+                            if ui.button("⏹ Stop").clicked() {
+                                self.recording_started = None;
                                 match self.recorder.stop() {
                                     Ok(path) => {
                                         let next_id = self.state.assets.len();
@@ -385,22 +593,68 @@ impl eframe::App for SiloCutApp {
                                     }
                                 }
                             }
-                        } else {
-                            if ui.button("Start Recording").clicked() {
-                                if let Some(path) = rfd::FileDialog::new()
-                                    .add_filter("MP4 Video", &["mp4"])
-                                    .set_file_name("recording.mp4")
-                                    .save_file()
-                                {
-                                    if let Err(e) = self.recorder.start(path, 30) {
-                                        self.export_status = format!("Failed to start recording: {}", e);
-                                    } else {
+                        });
+                    } else if let Some(t) = self.record_countdown {
+                        let remaining = 3.0 - t.elapsed().as_secs_f64();
+                        if remaining <= 0.0 {
+                            self.record_countdown = None;
+                            if let Some(path) = self.pending_record_path.take() {
+                                match self.recorder.start(path, self.record_fps, self.pending_record_region.take()) {
+                                    Ok(()) => {
+                                        self.recording_started = Some(std::time::Instant::now());
                                         self.export_status = "Recording started...".to_string();
+                                    }
+                                    Err(e) => {
+                                        self.export_status = format!("Failed to start recording: {}", e);
                                     }
                                 }
                             }
+                        } else {
+                            ui.label(
+                                egui::RichText::new(format!("Recording in {}…", remaining.ceil() as i32))
+                                    .size(18.0)
+                                    .strong(),
+                            );
+                            if ui.button("Cancel").clicked() {
+                                self.record_countdown = None;
+                                self.pending_record_path = None;
+                            }
                         }
-                    });
+                    } else {
+                        let monitors = recorder::list_monitors();
+                        ui.horizontal(|ui| {
+                            ui.label("FPS:");
+                            ui.radio_value(&mut self.record_fps, 30, "30");
+                            ui.radio_value(&mut self.record_fps, 60, "60");
+                        });
+                        if monitors.len() > 1 {
+                            if self.record_monitor >= monitors.len() {
+                                self.record_monitor = 0;
+                            }
+                            egui::ComboBox::from_label("Screen")
+                                .selected_text(
+                                    monitors.get(self.record_monitor).map(|m| m.label.clone()).unwrap_or_default(),
+                                )
+                                .show_ui(ui, |ui| {
+                                    for (i, m) in monitors.iter().enumerate() {
+                                        ui.selectable_value(&mut self.record_monitor, i, m.label.as_str());
+                                    }
+                                });
+                        }
+                        if ui.button("● Start Recording").clicked() {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("MP4 Video", &["mp4"])
+                                .set_file_name("recording.mp4")
+                                .save_file()
+                            {
+                                self.pending_record_region = monitors
+                                    .get(self.record_monitor)
+                                    .map(|m| (m.x, m.y, m.width, m.height));
+                                self.pending_record_path = Some(path);
+                                self.record_countdown = Some(std::time::Instant::now());
+                            }
+                        }
+                    }
                 });
                 ui.separator();
 
@@ -413,7 +667,7 @@ impl eframe::App for SiloCutApp {
                 } else {
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         for asset in &self.state.assets {
-                            let type_str = if asset.is_video { "▶ Video" } else { "♫ Audio" };
+                            let type_str = if asset.is_video { "▶ Video" } else if asset.is_image { "🖼 Image" } else { "♫ Audio" };
                             let is_decoding = self.decoding_assets.contains(&asset.id);
                             let label = if is_decoding {
                                 format!("{} - {} (Decoding Audio...)", type_str, asset.name)
@@ -442,7 +696,7 @@ impl eframe::App for SiloCutApp {
                                     };
                                     self.state.next_clip_id += 1;
                                     
-                                    if asset.is_video {
+                                    if asset.is_video || asset.is_image {
                                         if self.state.video_tracks.is_empty() {
                                             self.state.video_tracks.push(editor::Track {
                                                 id: self.state.next_track_id,
@@ -496,11 +750,21 @@ impl eframe::App for SiloCutApp {
             ui.separator();
 
             ui.vertical_centered(|ui| {
-                // Video display box
-                let aspect_ratio = 16.0 / 9.0;
-                let display_width = (ui.available_width() - 20.0).max(100.0);
-                let display_height = display_width / aspect_ratio;
-                
+                // Video display box, sized to the source frame's aspect ratio (falling
+                // back to 16:9), and fitted within the available area.
+                let aspect_ratio = self.preview.current_texture.as_ref()
+                    .map(|t| { let s = t.size(); s[0] as f32 / s[1].max(1) as f32 })
+                    .filter(|a| a.is_finite() && *a > 0.0)
+                    .unwrap_or(16.0 / 9.0);
+                let avail_w = (ui.available_width() - 20.0).max(100.0);
+                let avail_h = (ui.available_height() - 60.0).max(80.0);
+                let mut display_width = avail_w;
+                let mut display_height = display_width / aspect_ratio;
+                if display_height > avail_h {
+                    display_height = avail_h;
+                    display_width = display_height * aspect_ratio;
+                }
+
                 let (rect, _response) = ui.allocate_exact_size(
                     egui::vec2(display_width, display_height),
                     egui::Sense::hover()
@@ -579,6 +843,14 @@ impl eframe::App for SiloCutApp {
                             ui.radio_value(&mut self.export_fps, 60, "60 FPS");
                         });
                         ui.end_row();
+
+                        ui.label("Quality:");
+                        ui.horizontal(|ui| {
+                            ui.radio_value(&mut self.export_quality_scale, 0.5, "Low");
+                            ui.radio_value(&mut self.export_quality_scale, 1.0, "Medium");
+                            ui.radio_value(&mut self.export_quality_scale, 2.0, "High");
+                        });
+                        ui.end_row();
                     });
 
                     ui.add_space(10.0);
@@ -617,6 +889,7 @@ impl eframe::App for SiloCutApp {
                             let width = self.export_width;
                             let height = self.export_height;
                             let fps = self.export_fps;
+                            let quality = self.export_quality_scale;
 
                             let (tx, rx) = std::sync::mpsc::channel();
                             self.export_rx = Some(rx);
@@ -627,7 +900,7 @@ impl eframe::App for SiloCutApp {
                             // Run export in background thread
                             std::thread::spawn(move || {
                                 let res = export::export_timeline(
-                                    &state_clone, &path_clone, width, height, fps,
+                                    &state_clone, &path_clone, width, height, fps, quality,
                                     |p| { let _ = ptx.send(p); },
                                 );
                                 let _ = tx.send(res.map(|_| path_clone));
